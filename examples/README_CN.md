@@ -19,7 +19,6 @@ sshweave 负责配置编译、路由选择和字节流传输；系统 OpenSSH �
   - [传输失败与限速](#传输失败与限速)
 - [Hooks](#hooks)
 - [命令](#命令)
-- [与 assh 的功能对照](#与-assh-的功能对照)
 - [分层与维护](#分层与维护)
   - [提交与推送](#提交与推送)
 
@@ -461,30 +460,6 @@ rsync 的 `-e` 附加参数和组合短选项也会检查，合法的 rsync `-F`
 ping 默认 4 次，`--count 0` 持续运行，Ctrl+C 输出已完成探测的统计；
 没有成功探测时返回失败。sockets 仅枚举真正的 Unix socket，忽略同目录普通文件；
 ControlPath 中的字面 `*`、`?`、`[]` 不作为 glob 展开，只有动态主机 token 用于匹配。
-
-## 与 assh 的功能对照
-
-| assh 功能                              | sshweave                                     |
-| -------------------------------------- | -------------------------------------------- |
-| Host、alias、glob 模式                 | hosts/aliases；匹配顺序确定                  |
-| regex/动态名称                         | 显式 regex:、捕获替换、具体主机注册文件      |
-| templates、inherits、defaults          | 递归继承、强类型字段、循环检测               |
-| YAML includes、环境变量                | TOML includes、相对路径、glob、严格 `${VAR}` |
-| SSH 选项与多值选项                     | ssh 表，支持任意本机 OpenSSH 选项            |
-| 网关链、direct 优先、备用网关          | 原生 TCP、ssh -W、嵌套网关和建连前故障切换   |
-| ResolveCommand、ProxyCommand           | argv 数组，显式超时与退出错误                |
-| 本地命令、hooks 四种驱动/六类事件      | MiniJinja hooks + OpenSSH LocalCommand       |
-| 连接限速与统计                         | 双向共享限速、收发字节/时长/平均速率         |
-| 自动配置重建、ControlPath mkdir        | 原子替换、文件锁、权限、wrapper 预构建       |
-| config build/json/list/search/graphviz | 对应命令，另有 check/resolve                 |
-| connect dry-run、ping、info            | 对应命令；ping 与上游一样只支持直接 TCP      |
-| sockets list/master/flush              | 支持，flush 发送 OpenSSH 退出请求            |
-| SSH wrapper、shell completion          | SSH/SCP/SFTP/rsync wrapper，clap completion  |
-
-有意不移植原项目的实现细节/缺陷：父进程命令行窥探式日志等级推断、
-静默跳过坏 include/继承/失败 hook、未实现的自定义 DNS nameserver 字段、
-任意 SSH 连接时覆盖手写配置、Windows shell/通知后端。
-升级前请注意所有配置键、输出 JSON、模板语法和部分 CLI 参数均非兼容接口。
 
 ## 分层与维护
 

@@ -533,32 +533,6 @@ sockets lists only actual Unix sockets, ignoring ordinary files in the same
 directory. Literal `*`, `?`, and `[]` in ControlPath are not expanded as globs;
 only dynamic host tokens are used for matching.
 
-## Feature comparison with assh
-
-| assh feature                                    | sshweave                                                           |
-| ----------------------------------------------- | ------------------------------------------------------------------ |
-| Hosts, aliases, glob patterns                   | hosts/aliases with deterministic matching precedence               |
-| Regex/dynamic names                             | Explicit regex:, capture substitution, concrete-host registry      |
-| templates, inherits, defaults                   | Recursive inheritance, typed fields, cycle detection               |
-| YAML includes, environment variables            | TOML includes, relative paths, globs, strict `${VAR}`              |
-| SSH options and repeatable options              | ssh tables supporting arbitrary local OpenSSH options              |
-| Gateway chains, direct-first, fallback gateways | Native TCP, ssh -W, nested gateways, pre-session failover          |
-| ResolveCommand, ProxyCommand                    | argv arrays with explicit timeouts and exit errors                 |
-| Local commands, four hook drivers/six events    | MiniJinja hooks + OpenSSH LocalCommand                             |
-| Connection rate limits and statistics           | Shared bidirectional limit, byte counts/duration/average rate      |
-| Automatic rebuilds, ControlPath mkdir           | Atomic replacement, file locks, permissions, wrapper prebuild      |
-| config build/json/list/search/graphviz          | Corresponding commands plus check/resolve                          |
-| connect dry-run, ping, info                     | Corresponding commands; ping supports direct TCP only, as upstream |
-| sockets list/master/flush                       | Supported; flush sends an OpenSSH exit request                     |
-| SSH wrapper, shell completion                   | SSH/SCP/SFTP/rsync wrappers, clap completion                       |
-
-Intentionally not carried over: inferring log levels by inspecting parent command
-lines; silently skipping broken includes, inheritance, or failed hooks;
-the unimplemented custom DNS nameserver field; overwriting hand-written
-configuration on arbitrary SSH connections; and Windows shell/notification
-backends. Configuration keys, output JSON, template syntax, and some CLI
-arguments are **not drop-in compatible**; review them before migrating from assh.
-
 ## Architecture and maintenance
 
 ```text
