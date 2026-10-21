@@ -19,7 +19,7 @@ pub fn paths(config: &Config) -> Result<Vec<PathBuf>> {
     }
     let mut names = config.concrete_names();
     names.extend(store::known_hosts(config)?);
-    for name in names {
+    for name in config.route_targets(names)? {
         hosts.push(config.resolve(&name)?);
     }
     hosts.push(ResolvedHost {
@@ -29,6 +29,7 @@ pub fn paths(config: &Config) -> Result<Vec<PathBuf>> {
         port: 22,
         pattern: None,
         gateways: Vec::new(),
+        gateway_strategy: Default::default(),
         options: config.inherit_defaults()?,
     });
     for host in hosts {

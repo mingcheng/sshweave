@@ -1,12 +1,21 @@
 [package]
 name = "sshweave"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Composable SSH configuration and resilient gateway routing"
+description = "Command-line tool for composable SSH configuration and resilient gateway routing"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/mingcheng/sshweave"
+homepage = "https://github.com/mingcheng/sshweave"
+documentation = "https://github.com/mingcheng/sshweave/blob/HEAD/examples/README.md"
+authors = ["mingcheng <mingcheng@apache.org>"]
+keywords = ["ssh", "openssh", "cli", "proxy", "gateway"]
+categories = ["command-line-utilities", "config", "network-programming"]
+
+[[bin]]
+name = "sshweave"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
@@ -17,6 +26,8 @@ glob = "0.3"
 hostname = "0.4"
 indexmap = { version = "2", features = ["serde"] }
 minijinja = { version = "3", features = ["builtins", "json", "serde"] }
+ptree = { version = "0.5", default-features = false, features = ["ansi"] }
+rand = "0.9"
 regex = "1"
 rustix = { version = "1", features = ["process"] }
 serde = { version = "1", features = ["derive"] }

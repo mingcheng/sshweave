@@ -37,6 +37,8 @@ pub struct Host {
     pub aliases: Vec<String>,
     pub inherits: Vec<String>,
     pub gateways: Option<Vec<String>>,
+    pub gateway_strategy: Option<GatewayStrategy>,
+    pub proxy: Option<String>,
     pub connect_timeout: Option<u64>,
     pub resolve_command: Option<Vec<String>>,
     pub proxy_command: Option<Vec<String>>,
@@ -45,6 +47,25 @@ pub struct Host {
     pub comment: Option<String>,
     pub hooks: BTreeMap<Event, Vec<Hook>>,
     pub ssh: IndexMap<String, SshValue>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayStrategy {
+    #[default]
+    Random,
+    Sequential,
+    Chain,
+}
+
+impl GatewayStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Random => "random",
+            Self::Sequential => "sequential",
+            Self::Chain => "chain",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -69,6 +90,8 @@ impl Host {
             user,
             port,
             gateways,
+            gateway_strategy,
+            proxy,
             connect_timeout,
             resolve_command,
             proxy_command,
@@ -91,6 +114,18 @@ impl Host {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(key))
             .map(|(_, v)| v)
+    }
+
+    pub(crate) fn validate_gateway_strategy(&self) -> Result<()> {
+        if self.gateway_strategy == Some(GatewayStrategy::Chain) {
+            for gateway in self.gateways.iter().flatten() {
+                ensure!(
+                    gateway != "direct" && !gateway.contains('/'),
+                    "chain gateways must be individual host names, not direct or slash chains: {gateway:?}"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn control_path(&self) -> Result<Option<String>> {
@@ -140,8 +175,15 @@ pub struct Document {
     pub includes: Vec<String>,
     pub settings: Settings,
     pub defaults: Host,
+    pub proxies: IndexMap<String, Proxy>,
     pub templates: IndexMap<String, Host>,
     pub hosts: IndexMap<String, Host>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Proxy {
+    pub url: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -232,6 +274,9 @@ impl Config {
         let mut defaults = doc.defaults;
         defaults.fallback(&self.document.defaults);
         self.document.defaults = defaults;
+        for (name, proxy) in doc.proxies {
+            self.document.proxies.insert(name, proxy);
+        }
         for (name, host) in doc.templates {
             if let Some(existing) = self.document.templates.get_mut(&name) {
                 let mut merged = host;
@@ -285,6 +330,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        for (name, proxy) in &self.document.proxies {
+            util::valid_target(name)?;
+            ensure!(!name.contains('/'), "proxy name must not contain /");
+            crate::proxy::Endpoint::parse(&proxy.url).with_context(|| format!("proxy {name:?}"))?;
+        }
         for value in [
             &self.document.settings.output,
             &self.document.settings.known_hosts,
@@ -348,6 +398,14 @@ impl Config {
             for gateway in host.gateways.iter().flatten() {
                 util::valid_target(gateway)?;
             }
+            if let Some(proxy) = &host.proxy {
+                ensure!(
+                    self.document.proxies.contains_key(proxy),
+                    "{name}: unknown proxy {proxy:?}"
+                );
+            }
+            host.validate_gateway_strategy()
+                .with_context(|| format!("{name}: gateway_strategy"))?;
             let mut keys = BTreeSet::new();
             for (key, value) in &host.ssh {
                 ensure!(
@@ -391,9 +449,10 @@ impl Config {
             .keys()
             .chain(self.document.hosts.keys())
         {
-            self.inherit(name, &mut Vec::new())?;
+            self.inherit(name, &mut Vec::new())?
+                .validate_gateway_strategy()?;
         }
-        self.inherit_defaults()?;
+        self.inherit_defaults()?.validate_gateway_strategy()?;
         self.validate_gateway_graph()?;
         fn normalized(path: PathBuf) -> Result<PathBuf> {
             match path.canonicalize() {

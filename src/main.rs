@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde_json::json;
-use sshweave::{config::Config, render, runtime, sockets, store, util};
+use sshweave::{config::Config, render, runtime, sockets, store, topology, util};
 use std::{
     collections::BTreeSet,
     io::{self, Write},
@@ -61,6 +61,13 @@ enum Commands {
     },
     /// TCP connection latency probe (not ICMP).
     Ping(PingArgs),
+    /// Print SSH route topology without connecting or executing commands.
+    Topology {
+        target: String,
+        /// Use ASCII branches instead of Unicode.
+        #[arg(long)]
+        ascii: bool,
+    },
     /// Manage OpenSSH multiplexing sockets.
     Sockets {
         #[command(subcommand)]
@@ -213,6 +220,10 @@ async fn run(cli: Cli) -> Result<i32> {
                     }
                     if !host.gateways.is_empty() {
                         println!("  gateways: {}", host.gateways.join(", "));
+                        println!("  gateway_strategy: {}", host.gateway_strategy.as_str());
+                    }
+                    if let Some(proxy) = &host.options.proxy {
+                        println!("  proxy: {proxy}");
                     }
                 }
             }
@@ -242,7 +253,8 @@ async fn run(cli: Cli) -> Result<i32> {
             "os": std::env::consts::OS, "arch":std::env::consts::ARCH,
             "executable":std::env::current_exe()?, "source":config.source,
             "output":config.output()?, "known_hosts":config.known_hosts()?,
-            "files":config.files, "hosts":config.document.hosts.len(), "templates":config.document.templates.len()
+            "files":config.files, "hosts":config.document.hosts.len(), "templates":config.document.templates.len(),
+            "proxies":config.document.proxies.len()
         }))?,
         Commands::Connect {
             target,
@@ -261,9 +273,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 if let Some(user) = user {
                     host.user = user;
                 }
-                print_json(
-                    &json!({"host":host, "routes":if host.gateways.is_empty() { vec!["direct".to_owned()] } else { host.gateways.clone() }}),
-                )?;
+                print_json(&json!({"host":host, "routes":host.routes()}))?;
             } else {
                 if !no_rewrite && config.document.settings.automatic_rewrite {
                     if config.requires_materialization(&target)? {
@@ -280,6 +290,9 @@ async fn run(cli: Cli) -> Result<i32> {
         }
         Commands::Wrapper { program, args } => return wrapper(&config, program, args).await,
         Commands::Ping(args) => ping(&config, args).await?,
+        Commands::Topology { target, ascii } => {
+            topology::print(&config, &target, ascii)?;
+        }
         Commands::Sockets { command } => match command {
             SocketCommand::List => {
                 for path in sockets::paths(&config)? {
@@ -500,7 +513,9 @@ async fn ping(config: &Config, args: PingArgs) -> Result<()> {
     );
     let mut host = config.resolve(&args.target)?;
     ensure!(
-        host.gateways.is_empty() && host.options.proxy_command.is_none(),
+        host.gateways.is_empty()
+            && host.options.proxy_command.is_none()
+            && host.options.proxy.is_none(),
         "ping supports direct TCP routes only"
     );
     if let Some(port) = args.port {

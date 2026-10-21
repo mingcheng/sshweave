@@ -25,6 +25,12 @@ rate_limit = "10 MiB/s"
 IdentitiesOnly = true
 IdentityFile = ["~/.ssh/id_ed25519"]
 
+[proxies.local-http]
+url = "http://127.0.0.1:7890"
+
+[proxies.local-socks]
+url = "socks5://127.0.0.1:7890"
+
 [hosts.bastion]
 hostname = "bastion.example.net"
 aliases = ["gate"]
@@ -34,6 +40,7 @@ user = "ops"
 inherits = ["production"]
 hostname = "10.0.0.10"
 gateways = ["direct", "bastion"]
+gateway_strategy = "sequential"
 connect_timeout = 3
 comment = "Try the private network first, then the bastion."
 
@@ -53,3 +60,29 @@ user = "developer"
 inherits = ["production"]
 hostname = "worker-{2}.{region}.internal"
 gateways = ["bastion"]
+
+# Omit gateway_strategy to shuffle candidates on each connection.
+[hosts.random-service]
+hostname = "10.0.0.20"
+gateways = ["bastion", "edge"]
+
+[hosts.edge]
+hostname = "edge.example.net"
+
+# Local -> edge -> bastion -> chained-service.
+[hosts.chained-service]
+hostname = "10.0.0.30"
+gateway_strategy = "chain"
+gateways = ["edge", "bastion"]
+
+# Proxy settings are separate from SSH gateways.
+[hosts.proxied-service]
+hostname = "10.0.0.40"
+proxy = "local-http"
+
+# Local -> SOCKS5 proxy -> edge -> bastion -> proxied-chain.
+[hosts.proxied-chain]
+hostname = "10.0.0.50"
+proxy = "local-socks"
+gateway_strategy = "chain"
+gateways = ["edge", "bastion"]

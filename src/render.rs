@@ -83,6 +83,7 @@ pub fn ssh_config(
     output.push_str(&format!("# sshweave {}\n", env!("CARGO_PKG_VERSION")));
     let mut names = config.concrete_names();
     names.extend(known.iter().cloned());
+    let names = config.route_targets(names)?;
     for name in &names {
         util::valid_target(name)?;
         stanza(&mut output, &config.resolve(name)?, false, &[])?;
@@ -171,6 +172,12 @@ pub fn graphviz(config: &Config) -> Result<String> {
         }
     }
     let mut output = String::from("digraph sshweave {\n  rankdir=LR;\n");
+    for name in config.document.proxies.keys() {
+        output.push_str(&format!(
+            "  {} [shape=box];\n",
+            quoted(&format!("proxy:{name}"))?
+        ));
+    }
     for (name, host) in &config.document.templates {
         output.push_str(&format!(
             "  {} [shape=box,style=dashed];\n",
@@ -187,11 +194,19 @@ pub fn graphviz(config: &Config) -> Result<String> {
     for (name, host) in &config.document.hosts {
         output.push_str(&format!("  {} [shape=ellipse];\n", quoted(name)?));
         let resolved = config.resolve_inner(name)?;
-        for gateway in &resolved.gateways {
+        if let Some(proxy) = &resolved.options.proxy {
             output.push_str(&format!(
-                "  {} -> {} [label=\"gateway\"];\n",
+                "  {} -> {} [style=dotted,label=\"proxy\"];\n",
                 quoted(name)?,
-                quoted(gateway)?
+                quoted(&format!("proxy:{proxy}"))?
+            ));
+        }
+        for gateway in resolved.routes().into_iter().filter(|g| g != "direct") {
+            output.push_str(&format!(
+                "  {} -> {} [label={}];\n",
+                quoted(name)?,
+                quoted(&gateway)?,
+                quoted(&format!("gateway ({})", resolved.gateway_strategy.as_str()))?
             ));
         }
         for parent in &host.inherits {

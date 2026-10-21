@@ -77,22 +77,7 @@ pub fn remember(config: &Config, targets: &[String]) -> Result<()> {
     let _guard = lock(&path.with_extension("json.lock"))?;
     let mut known = known_hosts(config)?;
     let original = known.len();
-    let mut pending = targets.to_vec();
-    let mut visited = BTreeSet::new();
-    while let Some(target) = pending.pop() {
-        util::valid_target(&target)?;
-        if !visited.insert(target.clone()) {
-            continue;
-        }
-        ensure!(visited.len() <= 4096, "too many expanded gateway targets");
-        known.insert(target.clone());
-        if let Some((first, rest)) = target.split_once('/') {
-            pending.push(first.into());
-            pending.push(rest.into());
-        }
-        let host = config.resolve(&target)?;
-        pending.extend(host.gateways.into_iter().filter(|g| g != "direct"));
-    }
+    known.extend(config.route_targets(targets.iter().cloned())?);
     if known.len() != original {
         atomic_write(&path, &serde_json::to_vec_pretty(&known)?)?;
     }

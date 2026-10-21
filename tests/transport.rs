@@ -532,6 +532,7 @@ known_hosts="known.json"
 ssh_binary="{}"
 [hosts.db]
 gateways=["broken","healthy"]
+gateway_strategy="sequential"
 connect_timeout=2
 "#,
             ssh.display()
@@ -559,6 +560,337 @@ connect_timeout=2
 
 #[cfg(unix)]
 #[tokio::test]
+async fn random_routes_preserve_fallback_success_and_report_exhaustion() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let ssh = dir.path().join("fake-ssh");
+    let log = dir.path().join("routes.log");
+    executable(
+        &ssh,
+        r#"#!/bin/sh
+for arg do last="$arg"; done
+printf '%s\n' "$last" >> "$ROUTE_LOG"
+if [ "$SUCCEED_LAST" = yes ] && [ "$(wc -l < "$ROUTE_LOG" | tr -d ' ')" = 3 ]; then
+    printf 'SSH-2.0-random\r\n'
+    cat
+else
+    exit 7
+fi
+"#,
+    )?;
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        format!(
+            "[settings]\noutput='generated.conf'\nknown_hosts='known.json'\nssh_binary='{}'\n\
+         [hosts.db]\ngateways=['a','b','c']\n\
+         [hosts.db.hooks]\non_connect_error=[{{driver='write',message='failed-route:{{{{ gateway }}}}'}}]\n",
+            ssh.display()
+        ),
+    )?;
+    for succeed_last in [false, true] {
+        fs::write(&log, "")?;
+        let output = timeout(
+            Duration::from_secs(5),
+            binary()
+                .env("ROUTE_LOG", &log)
+                .env("SUCCEED_LAST", if succeed_last { "yes" } else { "no" })
+                .arg("-c")
+                .arg(&path)
+                .args(["connect", "--no-rewrite", "db"])
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await??;
+        let text = fs::read_to_string(&log)?;
+        let attempts: Vec<_> = text.lines().collect();
+        let mut sorted = attempts.clone();
+        sorted.sort();
+        assert_eq!(sorted, ["a", "b", "c"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if succeed_last {
+            assert!(output.status.success(), "{stderr}");
+            assert_eq!(output.stdout, b"SSH-2.0-random\r\n");
+        } else {
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            assert!(stderr.contains("all routes failed for db"));
+        }
+        for gateway in attempts.iter().take(if succeed_last { 2 } else { 3 }) {
+            assert!(stderr.contains(&format!("failed-route:{gateway}")));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chain_transport_uses_all_hops_in_order_and_never_bypasses_failure() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let ssh = dir.path().join("fake-ssh");
+    let log = dir.path().join("routes.log");
+    // Emulate SSH's ProxyCommand invocation, leaving route planning to the real CLI.
+    executable(
+        &ssh,
+        r#"#!/bin/sh
+for arg do last="$arg"; done
+printf '%s\n' "$*" >> "$ROUTE_LOG"
+if [ "$FAIL_CHAIN" = yes ]; then exit 7; fi
+exec "$SSHWEAVE_TEST_BINARY" -c "$SSHWEAVE_TEST_CONFIG" connect --no-rewrite "$last"
+"#,
+    )?;
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        format!(
+            r#"
+[settings]
+output="generated.conf"
+known_hosts="known.json"
+ssh_binary="{}"
+[hosts.db]
+hostname="db.internal"
+gateway_strategy="chain"
+gateways=["outer", "inner"]
+[hosts.inner]
+hostname="inner.internal"
+port=2222
+user="ops"
+[hosts.outer]
+proxy_command=["printf", 'SSH-2.0-chain\r\n']
+"#,
+            ssh.display()
+        ),
+    )?;
+    let config = Config::load(&path)?;
+    sshweave::store::sync(&config, false).await?;
+    let expanded = Command::new("ssh")
+        .args(["-G", "-F"])
+        .arg(config.output()?)
+        .arg("inner/outer")
+        .output()
+        .await?;
+    assert!(
+        expanded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&expanded.stderr)
+    );
+    let expanded = String::from_utf8(expanded.stdout)?;
+    assert!(expanded.contains("hostname inner.internal\n"));
+    assert!(expanded.contains("port 2222\n"));
+    assert!(expanded.contains("user ops\n"));
+    for fail in [false, true] {
+        fs::write(&log, "")?;
+        let output = timeout(
+            Duration::from_secs(5),
+            binary()
+                .env("ROUTE_LOG", &log)
+                .env("SSHWEAVE_TEST_BINARY", env!("CARGO_BIN_EXE_sshweave"))
+                .env("SSHWEAVE_TEST_CONFIG", &path)
+                .env("FAIL_CHAIN", if fail { "yes" } else { "no" })
+                .arg("-c")
+                .arg(&path)
+                .args(["connect", "--no-rewrite", "db"])
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await??;
+        let text = fs::read_to_string(&log)?;
+        let attempts: Vec<_> = text.lines().collect();
+        assert!(attempts[0].ends_with("-W db.internal:22 -- inner/outer"));
+        if fail {
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            assert_eq!(attempts.len(), 1, "must not bypass a failed chain");
+        } else {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"SSH-2.0-chain\r\n");
+            assert_eq!(attempts.len(), 2);
+            assert!(attempts[1].ends_with("-W inner.internal:2222 -- outer"));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn dry_run_exposes_effective_strategy_and_normalized_chain() -> Result<()> {
+    for (strategy, expected) in [
+        ("", vec!["outer", "inner"]),
+        ("gateway_strategy='sequential'", vec!["outer", "inner"]),
+        ("gateway_strategy='chain'", vec!["inner/outer"]),
+    ] {
+        let (dir, path) = fixture(&format!(
+            "[hosts.db]\ngateways=['outer','inner']\n{strategy}"
+        ))?;
+        let output = binary()
+            .arg("-c")
+            .arg(path)
+            .args(["connect", "--dry-run", "db"])
+            .output()
+            .await?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(value["routes"], serde_json::json!(expected));
+        assert_eq!(
+            value["host"]["gateway_strategy"],
+            if strategy.is_empty() {
+                "random"
+            } else if expected.len() == 1 {
+                "chain"
+            } else {
+                "sequential"
+            }
+        );
+        assert!(!dir.path().join("generated.conf").exists());
+        assert!(!dir.path().join("known.json").exists());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn named_proxy_is_applied_only_to_the_local_first_hop_of_an_ssh_chain() -> Result<()> {
+    let proxy = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_port = proxy.local_addr()?.port();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = proxy.accept().await?;
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            anyhow::ensure!(header.len() < 4096, "unexpected oversized CONNECT request");
+            header.push(stream.read_u8().await?);
+        }
+        assert_eq!(
+            header,
+            b"CONNECT outer.internal:2222 HTTP/1.1\r\nHost: outer.internal:2222\r\n\r\n"
+        );
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\n\r\nSSH-2.0-proxied-chain\r\n")
+            .await?;
+        let mut upload = Vec::new();
+        stream.read_to_end(&mut upload).await?;
+        stream.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+    let dir = tempfile::tempdir()?;
+    let ssh = dir.path().join("fake-ssh");
+    let log = dir.path().join("routes.log");
+    executable(
+        &ssh,
+        r#"#!/bin/sh
+for arg do last="$arg"; done
+printf '%s|%s\n' "$SSHWEAVE_ROUTE_PROXY" "$*" >> "$ROUTE_LOG"
+exec "$SSHWEAVE_TEST_BINARY" -c "$SSHWEAVE_TEST_CONFIG" connect --no-rewrite "$last"
+"#,
+    )?;
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        format!(
+            r#"
+[settings]
+output="generated.conf"
+known_hosts="known.json"
+ssh_binary="{}"
+[proxies.selected]
+url="http://127.0.0.1:{proxy_port}"
+[proxies.other]
+url="http://127.0.0.1:1"
+[hosts.db]
+proxy="selected"
+hostname="db.internal"
+gateway_strategy="chain"
+gateways=["outer", "inner"]
+[hosts.inner]
+hostname="inner.internal"
+[hosts.outer]
+hostname="outer.internal"
+port=2222
+proxy="other"
+"#,
+            ssh.display()
+        ),
+    )?;
+    let config = Config::load(&path)?;
+    sshweave::store::sync(&config, false).await?;
+    let output = timeout(
+        Duration::from_secs(5),
+        binary()
+            .env("ROUTE_LOG", &log)
+            .env("SSHWEAVE_TEST_BINARY", env!("CARGO_BIN_EXE_sshweave"))
+            .env("SSHWEAVE_TEST_CONFIG", &path)
+            .arg("-c")
+            .arg(&path)
+            .args(["connect", "--no-rewrite", "db"])
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await??;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"SSH-2.0-proxied-chain\r\n");
+    let log = fs::read_to_string(log)?;
+    let routes: Vec<_> = log.lines().collect();
+    assert_eq!(routes.len(), 2);
+    assert!(routes[0].ends_with("-W db.internal:22 -- inner/outer"));
+    assert!(routes[1].ends_with("-W inner.internal:22 -- outer"));
+    assert!(
+        routes
+            .iter()
+            .all(|line| line.starts_with("selected|") && line.contains("-o ControlPath=none"))
+    );
+    timeout(Duration::from_secs(5), server).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ping_and_dry_run_do_not_bypass_or_connect_to_a_configured_proxy() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let (dir, path) = fixture(&format!(
+        "[proxies.local]\nurl='http://127.0.0.1:{port}'\n[hosts.db]\nhostname='127.0.0.1'\nport={port}\nproxy='local'"
+    ))?;
+    let output = binary()
+        .arg("-c")
+        .arg(&path)
+        .args(["ping", "--count", "1", "db"])
+        .output()
+        .await?;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("ping supports direct TCP routes only")
+    );
+    let output = binary()
+        .arg("-c")
+        .arg(&path)
+        .args(["connect", "--dry-run", "db"])
+        .output()
+        .await?;
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(value["host"]["options"]["proxy"], "local");
+    assert_eq!(value["routes"], serde_json::json!(["direct"]));
+    assert!(
+        timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err()
+    );
+    assert!(!dir.path().join("generated.conf").exists());
+    assert!(!dir.path().join("known.json").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn proxy_startup_timeout_includes_waiting_after_stdout_closes() -> Result<()> {
     for close_stdout in ["", "exec 1>&-"] {
         let dir = tempfile::tempdir()?;
@@ -573,7 +905,7 @@ async fn proxy_startup_timeout_includes_waiting_after_stdout_closes() -> Result<
         fs::write(
             &path,
             format!(
-                "[settings]\noutput='generated.conf'\nknown_hosts='known.json'\nssh_binary='{}'\n[hosts.db]\ngateways=['stalled','healthy']\nconnect_timeout=1",
+                "[settings]\noutput='generated.conf'\nknown_hosts='known.json'\nssh_binary='{}'\n[hosts.db]\ngateways=['stalled','healthy']\ngateway_strategy='sequential'\nconnect_timeout=1",
                 ssh.display()
             ),
         )?;

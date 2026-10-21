@@ -1,5 +1,8 @@
 use anyhow::Result;
-use sshweave::{config::Config, render, store, util};
+use sshweave::{
+    config::{Config, GatewayStrategy},
+    render, store, util,
+};
 use std::{collections::BTreeSet, fs};
 use tempfile::TempDir;
 
@@ -132,10 +135,105 @@ hostname = "node-{id}.internal"
 
 #[test]
 fn slash_chain_overrides_configured_gateways() -> Result<()> {
-    let (_dir, config) = fixture("[hosts.db]\ngateways = ['old']")?;
+    let (_dir, config) =
+        fixture("[hosts.db]\ngateways = ['old', 'older']\ngateway_strategy='chain'")?;
     let host = config.resolve("db/gate/outer")?;
     assert_eq!(host.hostname, "db");
     assert_eq!(host.gateways, vec!["gate/outer"]);
+    assert_eq!(host.gateway_strategy, GatewayStrategy::Sequential);
+    assert_eq!(host.routes(), ["gate/outer"]);
+    Ok(())
+}
+
+#[test]
+fn gateway_strategies_resolve_inherit_and_disable() -> Result<()> {
+    let (_dir, config) = fixture(
+        r#"
+[defaults]
+gateway_strategy = "sequential"
+[templates.chain]
+gateway_strategy = "chain"
+gateways = ["outer", "inner"]
+[hosts.db]
+inherits = ["chain"]
+aliases = ["database"]
+[hosts.disabled]
+inherits = ["chain"]
+gateways = []
+[hosts.random]
+inherits = ["chain"]
+gateway_strategy = "random"
+[hosts.ordered]
+gateways = ["direct", "outer"]
+[hosts."*.private"]
+gateway_strategy = "chain"
+gateways = ["outer", "inner"]
+"#,
+    )?;
+    let db = config.resolve("database")?;
+    assert_eq!(db.gateway_strategy, GatewayStrategy::Chain);
+    assert_eq!(db.gateways, ["outer", "inner"]);
+    assert_eq!(db.routes(), ["inner/outer"]);
+    assert_eq!(config.resolve("disabled")?.routes(), ["direct"]);
+    assert_eq!(
+        config.resolve("random")?.gateway_strategy,
+        GatewayStrategy::Random
+    );
+    assert_eq!(config.resolve("random")?.routes(), ["outer", "inner"]);
+    assert_eq!(
+        config.resolve("ordered")?.gateway_strategy,
+        GatewayStrategy::Sequential
+    );
+    assert_eq!(config.resolve("ordered")?.routes(), ["direct", "outer"]);
+    assert_eq!(config.resolve("service.private")?.routes(), ["inner/outer"]);
+    assert_eq!(
+        config.resolve("service.private")?.gateway_strategy,
+        GatewayStrategy::Chain
+    );
+    let (_dir, defaults) = fixture("[hosts.db]\ngateways=['a','b']")?;
+    assert_eq!(
+        defaults.resolve("db")?.gateway_strategy,
+        GatewayStrategy::Random
+    );
+    assert_eq!(defaults.resolve("unknown")?.routes(), ["direct"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn chain_routes_are_materialized_deterministically_and_remembered() -> Result<()> {
+    let (_dir, config) = fixture(
+        r#"
+[hosts.db]
+gateway_strategy = "chain"
+gateways = ["outer", "inner"]
+[hosts.inner]
+hostname = "inner.internal"
+user = "ops"
+[hosts."*.internal"]
+user = "pattern"
+"#,
+    )?;
+    let generated = render::ssh_config(&config, &BTreeSet::new(), true)?;
+    assert_eq!(
+        generated,
+        render::ssh_config(&config, &BTreeSet::new(), true)?
+    );
+    assert!(generated.contains("Host inner/outer\n  HostName \"inner.internal\"\n  User \"ops\""));
+    assert!(generated.contains("Host outer\n"));
+    assert!(
+        render::graphviz(&config)?
+            .contains("\"db\" -> \"inner/outer\" [label=\"gateway (chain)\"]")
+    );
+    store::remember(&config, &["db".into()])?;
+    assert_eq!(
+        store::known_hosts(&config)?,
+        ["db", "inner/outer", "inner", "outer"]
+            .map(String::from)
+            .into_iter()
+            .collect()
+    );
+    assert!(store::sync(&config, true).await?);
+    assert!(!store::sync(&config, true).await?);
     Ok(())
 }
 
@@ -145,17 +243,70 @@ fn includes_are_relative_sorted_and_root_overrides() -> Result<()> {
     fs::create_dir(dir.path().join("parts"))?;
     fs::write(
         dir.path().join("parts/a.toml"),
-        "[templates.base]\nuser='base'\n[hosts.db]\nport=2222\nuser='included'",
+        "[templates.base]\nuser='base'\ngateway_strategy='random'\n[hosts.db]\nport=2222\nuser='included'\ngateway_strategy='random'",
     )?;
-    fs::write(dir.path().join("parts/b.toml"), "[hosts.db]\nport=3333")?;
+    fs::write(
+        dir.path().join("parts/b.toml"),
+        "[hosts.db]\nport=3333\ngateway_strategy='sequential'\ngateways=['outer','inner']",
+    )?;
     fs::write(
         dir.path().join("root.toml"),
-        "includes=['parts/*.toml']\n[hosts.db]\nuser='root'\ninherits=['base']",
+        "includes=['parts/*.toml']\n[hosts.db]\nuser='root'\ninherits=['base']\ngateway_strategy='chain'",
     )?;
     let config = Config::load(dir.path().join("root.toml"))?;
     assert_eq!(config.files.len(), 3);
     assert_eq!(config.resolve("db")?.port, 3333);
     assert_eq!(config.resolve("db")?.user, "root");
+    assert_eq!(
+        config.resolve("db")?.gateway_strategy,
+        GatewayStrategy::Chain
+    );
+    assert_eq!(config.resolve("db")?.routes(), ["inner/outer"]);
+    Ok(())
+}
+
+#[test]
+fn named_proxies_remain_separate_from_gateway_routes_and_materialized_hosts() -> Result<()> {
+    let (_dir, config) = fixture(
+        r#"
+[proxies.local]
+url = "http://127.0.0.1:7890"
+[proxies.socks]
+url = "socks5://[::1]:1080"
+[templates.proxied]
+proxy = "local"
+[hosts.db]
+inherits = ["proxied"]
+gateways = ["direct", "outer"]
+[hosts.private]
+proxy = "socks"
+gateway_strategy = "chain"
+gateways = ["outer", "inner"]
+[hosts.outer]
+hostname = "outer.internal"
+user = "ops"
+"#,
+    )?;
+    assert_eq!(
+        config.resolve("db")?.options.proxy.as_deref(),
+        Some("local")
+    );
+    assert_eq!(
+        config.resolve("private")?.options.proxy.as_deref(),
+        Some("socks")
+    );
+    assert_eq!(config.resolve("private")?.routes(), ["inner/outer"]);
+    let names = config.route_targets(config.concrete_names())?;
+    assert!(!names.contains("local") && !names.contains("socks"));
+    assert!(names.contains("inner/outer"));
+    let generated = render::ssh_config(&config, &BTreeSet::new(), true)?;
+    assert!(!generated.contains("127.0.0.1:7890"));
+    assert!(generated.contains("Host outer\n  HostName \"outer.internal\"\n  User \"ops\""));
+    store::remember(&config, &["private".into(), "db".into()])?;
+    assert_eq!(store::known_hosts(&config)?, names);
+    let graph = render::graphviz(&config)?;
+    assert!(!graph.contains("http://"));
+    assert!(graph.contains("\"db\" -> \"proxy:local\" [style=dotted,label=\"proxy\"]"));
     Ok(())
 }
 
@@ -172,6 +323,33 @@ fn includes_detect_cycles_and_missing_matches() -> Result<()> {
 }
 
 #[test]
+fn proxy_definitions_merge_by_name_and_references_inherit_normally() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("included.toml"),
+        "[proxies.local]\nurl='http://127.0.0.1:8080'\n[proxies.remote]\nurl='socks5://localhost:1080'\n[defaults]\nproxy='remote'\n[hosts.db]\nproxy='remote'",
+    )?;
+    fs::write(
+        dir.path().join("root.toml"),
+        "includes=['included.toml']\n[proxies.local]\nurl='http://127.0.0.1:7890'\n[hosts.db]\nproxy='local'",
+    )?;
+    let config = Config::load(dir.path().join("root.toml"))?;
+    assert_eq!(config.document.proxies.len(), 2);
+    assert_eq!(
+        config.document.proxies["local"].url,
+        "http://127.0.0.1:7890"
+    );
+    assert_eq!(
+        config.resolve("db")?.options.proxy.as_deref(),
+        Some("local")
+    );
+    assert_eq!(
+        config.resolve("arbitrary")?.options.proxy.as_deref(),
+        Some("remote")
+    );
+    Ok(())
+}
+#[test]
 fn repeated_includes_are_loaded_once() -> Result<()> {
     let dir = tempfile::tempdir()?;
     fs::write(dir.path().join("a.toml"), "includes=['b.toml','./b.toml']")?;
@@ -185,6 +363,31 @@ fn invalid_configuration_is_rejected() -> Result<()> {
     for text in [
         "[hosts.x]\nport=0",
         "[hosts.x]\nunknown_option=true",
+        "[hosts.x]\ngateway_strategy='unknown'",
+        "[hosts.x]\ngateway_strategy='chain'\ngateways=['direct']",
+        "[hosts.x]\ngateway_strategy='chain'\ngateways=['a/b']",
+        "[hosts.x]\ngateways=['proxy+https://localhost:7890']",
+        "[hosts.x]\ngateways=['proxy+http://localhost']",
+        "[hosts.x]\ngateways=['proxy+http://localhost:0']",
+        "[hosts.x]\ngateways=['proxy+http://localhost:65536']",
+        "[hosts.x]\ngateways=['proxy+http://user:password@localhost:7890']",
+        "[hosts.x]\ngateways=['proxy+http://localhost:7890/path']",
+        "[hosts.x]\ngateways=['proxy+http://localhost:7890?query']",
+        "[hosts.x]\ngateways=['proxy+http://localhost:7890#fragment']",
+        "[hosts.x]\ngateways=['proxy+http://::1:7890']",
+        "[hosts.x]\ngateways=['proxy+http://[bad]:7890']",
+        "[hosts.x]\ngateways=['proxy+http://localhost:+7890']",
+        "[hosts.x]\ngateways=['proxy+http://localhost:7890//']",
+        "[hosts.x]\ngateways=['proxy+http://localhost:7890']\nproxy_command=['nc','%h','%p']",
+        "[hosts.x]\ngateway_strategy='chain'\ngateways=['ssh-host','proxy+http://localhost:7890']",
+        "[hosts.x]\ngateways=['ssh-host/proxy+http://localhost:7890/other']",
+        "[hosts.x]\nproxy='missing'",
+        "[proxies.local]\nurl='http://localhost:7890'\n[hosts.x]\nproxy='local'\nproxy_command=['nc','%h','%p']",
+        "[proxies.local]\nunknown='http://localhost:7890'",
+        "[proxies.'bad/name']\nurl='http://localhost:7890'",
+        "[templates.bad]\ngateway_strategy='chain'\ngateways=['direct']",
+        "[templates.bad]\ngateway_strategy='chain'\n[defaults]\ninherits=['bad']\ngateways=['direct']",
+        "[hosts.a]\ngateway_strategy='chain'\ngateways=['b','c']\n[hosts.b]\ngateways=['a']",
         "[hosts.x]\ninherits=['missing']",
         "[templates.a]\ninherits=['b']\n[templates.b]\ninherits=['a']",
         "[hosts.a]\ngateways=['b']\n[hosts.b]\ngateways=['a']",
@@ -289,7 +492,9 @@ hostname = "%n.internal"
     let output = render::ssh_config(&config, &known, false)?;
     assert_eq!(output, render::ssh_config(&config, &known, false)?);
     assert!(output.contains("Host srv4/gate\n  HostName \"node-4.internal\""));
-    assert!(output.contains("Host *.prod !srv4/gate !web.prod\n  HostName \"%h.internal\""));
+    assert!(
+        output.contains("Host *.prod !gate !srv4 !srv4/gate !web.prod\n  HostName \"%h.internal\"")
+    );
     assert!(!output.contains("Host regex:"));
     assert!(output.contains("--no-rewrite"));
     Ok(())
@@ -308,7 +513,7 @@ aliases = ["database"]
 "#,
     )?;
     let graph = render::graphviz(&config)?;
-    assert!(graph.contains("\"db\" -> \"bastion\" [label=\"gateway\"]"));
+    assert!(graph.contains("\"db\" -> \"bastion\" [label=\"gateway (random)\"]"));
     assert!(graph.contains("\"db\" -> \"template:base\""));
     assert!(graph.contains("\"database\" -> \"db\""));
     Ok(())

@@ -1,10 +1,11 @@
 use crate::{
-    config::{Config, Event},
-    hooks,
+    config::{Config, Event, GatewayStrategy},
+    hooks, proxy,
     resolver::ResolvedHost,
     util,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use rand::{Rng, seq::SliceRandom};
 use serde::Serialize;
 use serde_json::json;
 use std::{
@@ -231,8 +232,48 @@ async fn open(
     host: &ResolvedHost,
     gateway: &str,
     stack: &[String],
+    proxy_name: Option<&str>,
 ) -> Result<Connection> {
     let seconds = host.options.connect_timeout.unwrap_or(10);
+    if gateway == "direct"
+        && let Some(proxy_name) = proxy_name
+    {
+        ensure!(
+            host.options.proxy_command.is_none(),
+            "proxy and proxy_command cannot be combined on the same transport"
+        );
+        let definition = config
+            .document
+            .proxies
+            .get(proxy_name)
+            .with_context(|| format!("unknown proxy {proxy_name:?}"))?;
+        let proxy = proxy::Endpoint::parse(&definition.url)?;
+        let startup = async {
+            let mut stream = dial(&proxy.host, proxy.port, 0)
+                .await
+                .with_context(|| format!("connect proxy {proxy_name:?}"))?;
+            proxy
+                .negotiate(&mut stream, &host.hostname, host.port)
+                .await?;
+            let first = stream
+                .read_u8()
+                .await
+                .context("read destination data after proxy handshake")?;
+            let (reader, writer) = stream.into_split();
+            Ok::<_, anyhow::Error>(Connection {
+                reader: Box::pin(std::io::Cursor::new(vec![first]).chain(reader)),
+                writer: Some(Box::pin(writer)),
+                child: None,
+            })
+        };
+        return if seconds == 0 {
+            startup.await
+        } else {
+            timeout(Duration::from_secs(seconds), startup)
+                .await
+                .context("proxy startup timeout")?
+        };
+    }
     let args = host
         .options
         .proxy_command
@@ -268,6 +309,14 @@ async fn open(
         .arg(format!("ConnectTimeout={seconds}"))
         .arg("-o")
         .arg("ExitOnForwardFailure=yes");
+    if let Some(proxy_name) = proxy_name {
+        command.env("SSHWEAVE_ROUTE_PROXY", proxy_name);
+        command
+            .arg("-o")
+            .arg("ControlMaster=no")
+            .arg("-o")
+            .arg("ControlPath=none");
+    }
     if let Some(args) = args {
         command.arg("--").arg(gateway).arg(shell_words::join(args));
     } else {
@@ -355,6 +404,14 @@ async fn relay(connection: &mut Connection, host: &ResolvedHost) -> Result<Stats
     Ok(stats)
 }
 
+fn attempt_routes(host: &ResolvedHost, rng: &mut impl Rng) -> Vec<String> {
+    let mut routes = host.routes();
+    if host.gateway_strategy == GatewayStrategy::Random {
+        routes.shuffle(rng);
+    }
+    routes
+}
+
 pub async fn connect(
     config: &Config,
     target: &str,
@@ -380,11 +437,19 @@ pub async fn connect(
         stack.join(" -> ")
     );
     stack.push(target.into());
-    let routes = if host.gateways.is_empty() {
-        vec!["direct".to_owned()]
-    } else {
-        host.gateways.clone()
+    let proxy_name = match std::env::var("SSHWEAVE_ROUTE_PROXY") {
+        Ok(name) => Some(name),
+        Err(std::env::VarError::NotPresent) => host.options.proxy.clone(),
+        Err(error) => return Err(error.into()),
     };
+    if let Some(name) = &proxy_name {
+        ensure!(
+            config.document.proxies.contains_key(name),
+            "unknown route proxy {name:?}"
+        );
+    }
+    host.options.proxy = proxy_name.clone();
+    let routes = attempt_routes(&host, &mut rand::rng());
     let mut errors = Vec::new();
     for gateway in routes {
         let mut attempt = host.clone();
@@ -396,7 +461,7 @@ pub async fn connect(
                 &json!({"host":attempt, "gateway":gateway}),
             )
             .await?;
-            open(config, &attempt, &gateway, &stack).await
+            open(config, &attempt, &gateway, &stack, proxy_name.as_deref()).await
         }
         .await;
         match result {
@@ -421,4 +486,62 @@ pub async fn connect(
         "all routes failed for {target}:\n{}",
         errors.join("\n")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Host;
+    use rand::{SeedableRng, rngs::StdRng};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn random_routes_shuffle_all_candidates_without_losing_fallbacks() {
+        let mut host = ResolvedHost {
+            name: "db".into(),
+            pattern: None,
+            hostname: "db.internal".into(),
+            user: "ops".into(),
+            port: 22,
+            gateways: vec!["direct".into(), "a".into(), "b".into()],
+            gateway_strategy: GatewayStrategy::Random,
+            options: Host::default(),
+        };
+        let mut orders = BTreeSet::new();
+        for seed in 0..64 {
+            let routes = attempt_routes(&host, &mut StdRng::seed_from_u64(seed));
+            let mut sorted = routes.clone();
+            sorted.sort();
+            assert_eq!(sorted, ["a", "b", "direct"]);
+            orders.insert(routes);
+        }
+        assert_eq!(
+            orders.len(),
+            6,
+            "random strategy must not retain a fixed order"
+        );
+        host.gateway_strategy = GatewayStrategy::Sequential;
+        assert_eq!(
+            attempt_routes(&host, &mut StdRng::seed_from_u64(0)),
+            host.gateways
+        );
+        host.gateway_strategy = GatewayStrategy::Chain;
+        host.gateways = vec!["outer".into(), "inner".into()];
+        assert_eq!(
+            attempt_routes(&host, &mut StdRng::seed_from_u64(0)),
+            ["inner/outer"]
+        );
+        host.gateways.clear();
+        for strategy in [
+            GatewayStrategy::Random,
+            GatewayStrategy::Sequential,
+            GatewayStrategy::Chain,
+        ] {
+            host.gateway_strategy = strategy;
+            assert_eq!(
+                attempt_routes(&host, &mut StdRng::seed_from_u64(0)),
+                ["direct"]
+            );
+        }
+    }
 }

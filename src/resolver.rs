@@ -1,5 +1,5 @@
 use crate::{
-    config::{Config, Host},
+    config::{Config, GatewayStrategy, Host},
     util,
 };
 use anyhow::{Context, Result, ensure};
@@ -47,10 +47,29 @@ pub struct ResolvedHost {
     pub user: String,
     pub port: u16,
     pub gateways: Vec<String>,
+    pub gateway_strategy: GatewayStrategy,
     pub options: Host,
 }
 
 impl ResolvedHost {
+    /// Deterministic route plan; random ordering is applied only when connecting.
+    pub fn routes(&self) -> Vec<String> {
+        if self.gateways.is_empty() {
+            vec!["direct".into()]
+        } else if self.gateway_strategy == GatewayStrategy::Chain {
+            vec![
+                self.gateways
+                    .iter()
+                    .rev()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            ]
+        } else {
+            self.gateways.clone()
+        }
+    }
+
     pub fn expand(&self, value: &str, gateway: &str) -> Result<String> {
         let local_user = std::env::var("USER").context("USER is not set")?;
         let home = std::env::var("HOME").context("HOME is not set")?;
@@ -218,15 +237,29 @@ impl Config {
         let gateways = chain
             .map(|s| vec![s.to_owned()])
             .unwrap_or_else(|| options.gateways.clone().unwrap_or_default());
-        Ok(ResolvedHost {
+        let gateway_strategy = if chain.is_some() {
+            GatewayStrategy::Sequential
+        } else {
+            options.validate_gateway_strategy()?;
+            options.gateway_strategy.unwrap_or_default()
+        };
+        let host = ResolvedHost {
             name: target.into(),
             pattern: canonical.map(str::to_owned),
             hostname,
             user,
             port: options.port.unwrap_or(22),
             gateways,
+            gateway_strategy,
             options,
-        })
+        };
+        ensure!(
+            host.options.proxy_command.is_none()
+                || host.options.proxy.is_none()
+                || !host.routes().iter().any(|route| route == "direct"),
+            "proxy and proxy_command cannot be combined on the same transport"
+        );
+        Ok(host)
     }
 
     pub(crate) fn validate_gateway_graph(&self) -> Result<()> {
@@ -238,9 +271,9 @@ impl Config {
             );
             stack.push(target.into());
             let host = config.resolve_inner(target)?;
-            for gateway in &host.gateways {
+            for gateway in host.routes() {
                 if gateway != "direct" {
-                    visit(config, gateway, stack)?;
+                    visit(config, &gateway, stack)?;
                 }
             }
             stack.pop();
@@ -260,5 +293,31 @@ impl Config {
             .filter(|n| !is_pattern(n))
             .cloned()
             .collect()
+    }
+
+    pub fn route_targets(
+        &self,
+        targets: impl IntoIterator<Item = String>,
+    ) -> Result<BTreeSet<String>> {
+        let mut pending: Vec<_> = targets.into_iter().collect();
+        let mut visited = BTreeSet::new();
+        while let Some(target) = pending.pop() {
+            util::valid_target(&target)?;
+            if !visited.insert(target.clone()) {
+                continue;
+            }
+            ensure!(visited.len() <= 4096, "too many expanded gateway targets");
+            if let Some((first, rest)) = target.split_once('/') {
+                pending.push(first.into());
+                pending.push(rest.into());
+            }
+            pending.extend(
+                self.resolve(&target)?
+                    .routes()
+                    .into_iter()
+                    .filter(|g| g != "direct"),
+            );
+        }
+        Ok(visited)
     }
 }
