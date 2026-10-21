@@ -1,0 +1,55 @@
+# Paths are relative to this file. Install a copy in ~/.ssh/sshweave.toml.
+[settings]
+output = "~/.ssh/sshweave.conf"
+known_hosts = "~/.ssh/sshweave_known_hosts.json"
+automatic_rewrite = true
+
+[defaults]
+user = "${USER}"
+connect_timeout = 10
+control_master_mkdir = true
+
+[defaults.ssh]
+ServerAliveInterval = 30
+ServerAliveCountMax = 3
+ControlMaster = "auto"
+ControlPersist = "5m"
+ControlPath = "~/.ssh/sshweave-control/%C"
+
+[templates.production]
+user = "deploy"
+rate_limit = "10 MiB/s"
+
+[templates.production.ssh]
+IdentitiesOnly = true
+IdentityFile = ["~/.ssh/id_ed25519"]
+
+[hosts.bastion]
+hostname = "bastion.example.net"
+aliases = ["gate"]
+user = "ops"
+
+[hosts.database]
+inherits = ["production"]
+hostname = "10.0.0.10"
+gateways = ["direct", "bastion"]
+connect_timeout = 3
+comment = "Try the private network first, then the bastion."
+
+[hosts.database.hooks]
+before_connect = [
+  { driver = "write", message = "Connecting to {{ host.user }}@{{ host.hostname }}:{{ host.port }} via {{ gateway }}" },
+]
+on_disconnect = [
+  { driver = "write", message = "Disconnected: sent={{ stats.sent_bytes }}, received={{ stats.received_bytes }}, duration={{ stats.duration_seconds }}s" },
+]
+
+[hosts."*.dev"]
+hostname = "%n.example.net"
+user = "developer"
+
+[hosts."regex:^worker-(?P<region>[a-z]+)-([0-9]+)$"]
+inherits = ["production"]
+hostname = "worker-{2}.{region}.internal"
+gateways = ["bastion"]
+

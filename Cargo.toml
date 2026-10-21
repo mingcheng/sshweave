@@ -1,0 +1,34 @@
+[package]
+name = "sshweave"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Composable SSH configuration and resilient gateway routing"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/mingcheng/sshweave"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+fs2 = "0.4"
+glob = "0.3"
+hostname = "0.4"
+indexmap = { version = "2", features = ["serde"] }
+minijinja = { version = "3", features = ["builtins", "json", "serde"] }
+regex = "1"
+rustix = { version = "1", features = ["process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.11"
+shell-words = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+toml = { version = "1.1", features = ["preserve_order"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+strip = true

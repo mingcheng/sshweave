@@ -1,0 +1,24 @@
+# Build output (including a symlink to an external cache).
+/target
+
+# Local editor and operating-system files.
+/.vscode/
+/.idea/
+.DS_Store
+._*
+*.swp
+*.swo
+*~
+
+# Local environment and private keys.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+id_ecdsa
+id_ecdsa.pub
+id_ed25519
+id_ed25519.pub
