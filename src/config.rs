@@ -125,8 +125,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            output: "~/.ssh/sshweave.conf".into(),
-            known_hosts: "~/.ssh/sshweave_known_hosts.json".into(),
+            output: "~/.config/sshweave/sshweave.conf".into(),
+            known_hosts: "~/.config/sshweave/sshweave_known_hosts.json".into(),
             ssh_binary: "ssh".into(),
             binary: None,
             automatic_rewrite: true,
@@ -150,6 +150,8 @@ pub struct Config {
     pub files: Vec<PathBuf>,
     pub document: Document,
 }
+
+const DEFAULT_INCLUDE: &str = "${HOME}/.config/sshweave/conf.d/*.toml";
 
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
@@ -191,22 +193,35 @@ impl Config {
         ensure!(active.len() < 64, "include nesting exceeds 64 files");
         active.insert(path.clone());
         let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let doc: Document =
+        let mut doc: Document =
             toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-        if root {
-            self.document.settings = doc.settings;
-        }
-        self.files.push(path.clone());
         let base = path
             .parent()
             .context("configuration has no parent directory")?;
+        let default_pattern = if root {
+            Some(util::expand_path(DEFAULT_INCLUDE, base)?)
+        } else {
+            None
+        };
+        if root {
+            self.document.settings = doc.settings;
+            if !doc
+                .includes
+                .iter()
+                .any(|include| include == DEFAULT_INCLUDE)
+            {
+                doc.includes.insert(0, DEFAULT_INCLUDE.into());
+            }
+            self.document.includes = doc.includes.clone();
+        }
+        self.files.push(path.clone());
         for include in doc.includes {
             let pattern = util::expand_path(&include, base)?;
             let mut paths = glob::glob(&pattern.to_string_lossy())?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             paths.sort();
             ensure!(
-                !paths.is_empty(),
+                !paths.is_empty() || default_pattern.as_ref() == Some(&pattern),
                 "include {include:?} in {} matches no files",
                 path.display()
             );

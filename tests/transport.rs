@@ -31,6 +31,280 @@ fn binary() -> Command {
 }
 
 #[tokio::test]
+async fn default_paths_keep_generated_state_in_config_directory() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let home_path = home.path().canonicalize()?;
+    let directory = home_path.join(".config/sshweave");
+    fs::create_dir_all(&directory)?;
+    let source = directory.join("sshweave.toml");
+    fs::write(&source, "[defaults]\nuser='ops'\n")?;
+    let source = source.canonicalize()?;
+    let directory = source.parent().context("missing source directory")?;
+    let output = binary()
+        .env("HOME", &home_path)
+        .env_remove("SSHWEAVE_CONFIG")
+        .arg("info")
+        .output()
+        .await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let info: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(info["source"], source.to_string_lossy().as_ref());
+    assert_eq!(
+        info["output"],
+        directory.join("sshweave.conf").to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        info["known_hosts"],
+        directory
+            .join("sshweave_known_hosts.json")
+            .to_string_lossy()
+            .as_ref()
+    );
+
+    let output = binary()
+        .env("HOME", &home_path)
+        .env_remove("SSHWEAVE_CONFIG")
+        .env("TMPDIR", home.path().join("nonexistent-temp"))
+        .args(["connect", "database/gateway"])
+        .output()
+        .await?;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("configuration updated after OpenSSH read it")
+    );
+    assert!(
+        fs::read_to_string(directory.join("sshweave.conf"))?.starts_with(sshweave::render::HEADER)
+    );
+    let known: std::collections::BTreeSet<String> =
+        serde_json::from_slice(&fs::read(directory.join("sshweave_known_hosts.json"))?)?;
+    assert_eq!(
+        known,
+        ["database", "gateway", "database/gateway"]
+            .map(String::from)
+            .into_iter()
+            .collect()
+    );
+    let files = fs::read_dir(directory)?
+        .map(|entry| Ok(entry?.file_name()))
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    assert_eq!(
+        files,
+        [
+            "sshweave.toml",
+            "sshweave.conf",
+            "sshweave.conf.lock",
+            "sshweave_known_hosts.json",
+            "sshweave_known_hosts.json.lock",
+        ]
+        .map(std::ffi::OsString::from)
+        .into_iter()
+        .collect()
+    );
+    assert!(!home.path().join(".ssh").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn config_environment_and_cli_override_default_path() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let (env_dir, env_path) = fixture("[hosts.from_env]")?;
+    let (_cli_dir, cli_path) = fixture("[hosts.from_cli]")?;
+    for (args, expected) in [
+        (vec!["config", "list", "--json"], "from_env"),
+        (
+            vec![
+                "-c",
+                cli_path
+                    .to_str()
+                    .context("configuration path is not UTF-8")?,
+                "config",
+                "list",
+                "--json",
+            ],
+            "from_cli",
+        ),
+    ] {
+        let output = binary()
+            .env("HOME", home.path())
+            .env("SSHWEAVE_CONFIG", &env_path)
+            .args(args)
+            .output()
+            .await?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(value["hosts"][0]["name"], expected);
+    }
+    let config = Config::load(&env_path)?;
+    assert_eq!(
+        config.output()?,
+        env_dir.path().canonicalize()?.join("generated.conf")
+    );
+    assert_eq!(
+        config.known_hosts()?,
+        env_dir.path().canonicalize()?.join("known.json")
+    );
+    assert!(!home.path().join(".config").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_fragments_merge_with_explicit_includes_and_root() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let (root_dir, source) = fixture("")?;
+    let fragments = home.path().join(".config/sshweave/conf.d");
+    fs::create_dir_all(&fragments)?;
+    fs::write(
+        fragments.join("a.toml"),
+        "[settings]\noutput='ignored.conf'\n[templates.base]\nuser='fragment'\n\
+         [hosts.db]\ninherits=['base']\nport=2201\nhostname='first.internal'",
+    )?;
+    fs::write(
+        fragments.join("b.toml"),
+        "includes=['../shared.toml']\n[hosts.db]\nport=2202\nhostname='last.internal'",
+    )?;
+    fs::write(
+        fragments
+            .parent()
+            .context("missing parent")?
+            .join("shared.toml"),
+        "[hosts.shared]\nuser='shared'",
+    )?;
+    fs::write(fragments.join("ignored.txt"), "not TOML")?;
+    fs::write(
+        root_dir.path().join("extra.toml"),
+        "[hosts.db]\nport=3300\nuser='explicit'",
+    )?;
+    let export = || {
+        let mut command = binary();
+        command
+            .env("HOME", home.path())
+            .env_remove("SSHWEAVE_CONFIG")
+            .arg("-c")
+            .arg(&source);
+        command
+    };
+
+    for (includes, expected_user, expected_port, expected_includes) in [
+        ("", "fragment", 2202, 1),
+        ("includes=['extra.toml']\n", "explicit", 3300, 2),
+        (
+            "includes=['${HOME}/.config/sshweave/conf.d/*.toml','extra.toml']\n",
+            "explicit",
+            3300,
+            2,
+        ),
+    ] {
+        fs::write(
+            &source,
+            format!("{includes}[hosts.db]\ninherits=['base']\nconnect_timeout=7\n"),
+        )?;
+        let output = export().args(["config", "json"]).output().await?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let document = &value["document"];
+        assert_eq!(
+            document["includes"].as_array().unwrap().len(),
+            expected_includes
+        );
+        assert_eq!(
+            document["includes"][0],
+            "${HOME}/.config/sshweave/conf.d/*.toml"
+        );
+        assert_eq!(
+            value["files"].as_array().unwrap().len(),
+            if expected_includes == 1 { 4 } else { 5 }
+        );
+        assert_eq!(
+            document["settings"]["output"],
+            "~/.config/sshweave/sshweave.conf"
+        );
+        let output = export().args(["config", "resolve", "db"]).output().await?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let host: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(host["user"], expected_user);
+        assert_eq!(host["port"], expected_port);
+        assert_eq!(host["hostname"], "last.internal");
+        assert_eq!(host["options"]["connect_timeout"], 7);
+    }
+
+    fs::write(
+        &source,
+        "includes=['extra.toml','${HOME}/.config/sshweave/conf.d/*.toml']\n\
+         [hosts.db]\nuser='root'",
+    )?;
+    let output = export().args(["config", "resolve", "db"]).output().await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let host: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(host["user"], "root");
+    assert_eq!(host["port"], 2202);
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_fragments_allow_empty_directory_but_report_invalid_files() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let (_dir, source) = fixture("")?;
+    let fragments = home.path().join(".config/sshweave/conf.d");
+    let check = || {
+        let mut command = binary();
+        command
+            .env("HOME", home.path())
+            .env_remove("SSHWEAVE_CONFIG")
+            .arg("-c")
+            .arg(&source)
+            .args(["config", "check"]);
+        command
+    };
+    for create_directory in [false, true] {
+        if create_directory {
+            fs::create_dir_all(&fragments)?;
+        }
+        let output = check().output().await?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for (text, expected) in [
+        ("invalid TOML", "parse"),
+        ("includes=['missing.toml']", "matches no files"),
+        ("includes=['./part.toml']", "include cycle"),
+    ] {
+        fs::write(fragments.join("part.toml"), text)?;
+        let output = check().output().await?;
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn tcp_proxy_preserves_binary_data_and_half_close() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();

@@ -21,7 +21,7 @@ struct Cli {
         long,
         short = 'c',
         env = "SSHWEAVE_CONFIG",
-        default_value = "~/.ssh/sshweave.toml"
+        default_value = "~/.config/sshweave/sshweave.toml"
     )]
     config: PathBuf,
     #[arg(long, short = 'v')]

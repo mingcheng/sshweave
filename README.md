@@ -12,8 +12,8 @@ macOS 的 `osascript` 或 Linux 的 `notify-send`。普通连接不依赖 nc/soc
 ```sh
 cargo build --release --locked
 cargo install --path . --locked
-mkdir -p ~/.ssh
-cp examples/sshweave.toml ~/.ssh/sshweave.toml
+mkdir -p ~/.config/sshweave
+cp examples/sshweave.toml ~/.config/sshweave/sshweave.toml
 # 先按自己的环境修改示例中的域名、用户名和密钥路径。
 sshweave config check
 sshweave config build --write
@@ -54,7 +54,7 @@ command sftp database
 command rsync -az source/ database:/srv/
 ```
 
-自定义配置可设置 `export SSHWEAVE_CONFIG="$HOME/.ssh/sshweave.toml"`，
+自定义配置可设置 `export SSHWEAVE_CONFIG="$HOME/.config/sshweave/sshweave.toml"`，
 上述所有 alias 都会使用该配置；
 或使用 `alias ssh='sshweave -c /absolute/path/sshweave.toml wrapper ssh'`。
 其他 alias 同样可以把 `-c /absolute/path/sshweave.toml` 放在 wrapper 之前。
@@ -70,7 +70,7 @@ alias 仅影响当前 shell，不会改变 Git/GUI 等程序的 SSH 调用；
 也可以在**自己维护的** `~/.ssh/config` 顶部加入：
 
 ```sshconfig
-Include ~/.ssh/sshweave.conf
+Include ~/.config/sshweave/sshweave.conf
 ```
 
 随后直接使用 `ssh`、`scp`、`sftp`、`rsync` 或基于 OpenSSH 的 Git/GUI。
@@ -92,12 +92,26 @@ sshweave 只覆盖带有自身标记的生成文件，**不会自动改写手写
 
 完整可用的配置结构见 [examples/sshweave.toml](examples/sshweave.toml)。
 
+默认配置文件为 `$HOME/.config/sshweave/sshweave.toml`，生成的 OpenSSH 配置、
+已实例化主机缓存、锁文件和原子写入的临时文件均位于 `$HOME/.config/sshweave/`。
+示例中的控制套接字也存放在该目录的 `control/` 子目录。
+`-c` / `SSHWEAVE_CONFIG` 可覆盖配置文件位置，`settings.output`、
+`settings.known_hosts` 和 SSH `ControlPath` 仍可显式指定其他路径；
+相对配置路径以 TOML 文件所在目录为基准。旧路径不会自动迁移，已有配置需手动移动，
+并同步修改显式路径及 `~/.ssh/config` 中的 Include。
+SSH 私钥和 OpenSSH 自身的 `known_hosts` 仍使用原有位置，不会迁移。
+
+无需声明 includes，程序会自动加载 `${HOME}/.config/sshweave/conf.d/*.toml`，
+并将该路径加入根配置的有效 includes 列表（`config json` 可查看）。
+即使使用 `-c` / `SSHWEAVE_CONFIG`，仍会加载此固定目录；目录不存在或无匹配文件时允许为空。
+
 ```toml
-includes = ["conf.d/*.toml", "${HOME}/.config/sshweave/shared.toml"]
+# 可选：默认 conf.d 之外的其他配置
+includes = ["extra.d/*.toml", "${HOME}/.config/sshweave/shared.toml"]
 
 [settings]
-output = "~/.ssh/sshweave.conf"
-known_hosts = "~/.ssh/sshweave_known_hosts.json"
+output = "~/.config/sshweave/sshweave.conf"
+known_hosts = "~/.config/sshweave/sshweave_known_hosts.json"
 ssh_binary = "ssh"
 automatic_rewrite = true
 # binary = "/absolute/path/to/sshweave"  # 默认使用当前可执行文件的绝对路径
@@ -131,8 +145,11 @@ LocalForward = ["8080 localhost:80", "9090 localhost:90"]
 ### 解析、继承和匹配规则
 
 - includes 相对包含它的文件解析，支持 glob、`~` 和 `${VAR}`，匹配结果排序；
-  文件按规范化路径去重。缺失文件、未匹配的 include、循环和无效 TOML 都会报错。
+  文件按规范化路径去重。默认 conf.d 允许为空，其他未匹配的 include、
+  缺失文件、循环和无效 TOML 都会报错。
 - 同名条目按字段合并：根文件 > 后面的 include > 前面的 include。
+  默认 conf.d 自动放在 includes 开头，显式 includes 可覆盖它；若已显式声明该默认路径，
+  则保留其声明位置。conf.d 内按文件名排序，后面的文件优先。
   settings 仅取根文件；其他文件仅用于 defaults/templates/hosts/includes。
 - 继承允许任意深度（防护上限 64）：主机自身 > 第一个 parent > 后续 parent。
   先查 template，再查 host；可用 `template:name` / `host:name` 明确指定。
@@ -183,7 +200,7 @@ control_master_mkdir = true
 
 [hosts.dynamic.ssh]
 ControlMaster = "auto"
-ControlPath = "~/.ssh/controls/%n/%C"
+ControlPath = "~/.config/sshweave/control/%C"
 ```
 
 - `resolve_command` 为 argv 数组，不经 shell，stdout 必须只包含一个 hostname/IP；
