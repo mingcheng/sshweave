@@ -10,6 +10,8 @@ sshweave 负责配置编译、路由选择和字节流传输；系统 OpenSSH �
 
 - [目录](#目录)
 - [构建与开始使用](#构建与开始使用)
+  - [发布包安装](#发布包安装)
+  - [日常接入](#日常接入)
 - [TOML 配置](#toml-配置)
   - [解析、继承和匹配规则](#解析继承和匹配规则)
   - [SSH 选项与运行时命令](#ssh-选项与运行时命令)
@@ -19,12 +21,15 @@ sshweave 负责配置编译、路由选择和字节流传输；系统 OpenSSH �
   - [传输失败与限速](#传输失败与限速)
 - [Hooks](#hooks)
 - [命令](#命令)
+  - [管理已实例化主机缓存](#管理已实例化主机缓存)
 - [分层与维护](#分层与维护)
+  - [解析性能](#解析性能)
+  - [发布流程](#发布流程)
   - [提交与推送](#提交与推送)
 
 ## 构建与开始使用
 
-要求 Rust 1.88+、Unix 系统（macOS/Linux）和 OpenSSH。桌面通知还需要
+从源码构建要求 Rust 1.88+、Unix 系统（macOS/Linux）和 OpenSSH。桌面通知还需要
 macOS 的 `osascript` 或 Linux 的 `notify-send`。普通连接不依赖 nc/socat。
 以下构建、安装、复制示例和维护命令均从仓库根目录执行，而不是 examples 目录。
 
@@ -50,6 +55,41 @@ sshweave wrapper scp file.txt database:/tmp/
 sshweave wrapper sftp database
 sshweave wrapper rsync -az source/ database:/srv/
 ```
+
+### 发布包安装
+
+[GitHub Releases](https://github.com/mingcheng/sshweave/releases) 的已发布制品可包含
+`sshweave-VERSION-TARGET.tar.gz` 及对应 `.sha256` 文件，目标平台如下：
+
+| TARGET | 平台 |
+| --- | --- |
+| `x86_64-unknown-linux-gnu` | Linux x86_64，在 Ubuntu 24.04 构建 |
+| `aarch64-unknown-linux-gnu` | Linux ARM64，在 Ubuntu 24.04 构建 |
+| `x86_64-apple-darwin` | macOS Intel，部署目标版本为 13.0 |
+| `aarch64-apple-darwin` | macOS Apple Silicon，部署目标版本为 13.0 |
+
+二进制仍需要 OpenSSH，但不需要 Rust、Python 或 Go。Linux 发布包需要兼容的
+glibc；旧系统或 musl/Alpine 建议从源码构建。macOS 发布包不包含 Developer ID
+签名或公证；要求这些能力的环境需使用组织认可的签名/分发流程或源码安装，
+不要关闭系统安全检查。
+
+从同一个 release 下载压缩包与校验文件，将下面的 VERSION、TARGET 替换为实际值：
+
+```sh
+# Linux:
+sha256sum -c sshweave-VERSION-TARGET.tar.gz.sha256
+# macOS:
+shasum -a 256 -c sshweave-VERSION-TARGET.tar.gz.sha256
+tar -xzf sshweave-VERSION-TARGET.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 755 sshweave-VERSION-TARGET/sshweave "$HOME/.local/bin/sshweave"
+```
+
+按需将 `$HOME/.local/bin` 加入 PATH。发布包包含本指南、示例 TOML、许可证及
+Bash/Fish/Zsh 补全文件；补全文件按 shell 的要求安装到对应目录。
+`SHA256SUMS` 汇总四个平台压缩包的校验和。
+
+### 日常接入
 
 在 Bash/Zsh 中可以按需设置以下 alias，继续使用熟悉的命令：
 
@@ -236,6 +276,11 @@ ControlPath = "~/.config/sshweave/control/%C"
   resolve_command 和代理启动阶段。代理进程必须读到目的端的首字节才算建立成功，
   适用于会先发送 banner 的 SSH 服务；该字节不会丢失。代理关闭 stdout 却未退出时，
   等待进程结束也受启动超时约束，不会无限阻塞后续候选路由。
+- 当目标有多条候选路由时，原生 TCP 的 direct 候选也会等待目的端首字节。
+  首字节前 EOF 或超时会尝试下一个候选，不转发会话数据；DNS、TCP 建连和探测
+  共用一个超时预算，探测字节会完整回放。只有一条原生直连路由时保留通用 TCP
+  行为，包括客户端先发数据和半关闭。HTTP/SOCKS5 与命令传输仍保留原有的
+  服务端首字节探测，即使只有一条路由也不变。
 - 如果 `control_master_mkdir = true`，在需要时以 0700 创建 ControlPath 父目录。
 - 目标名称允许通常的 DNS/IP/alias 字符，不接受 shell 表达式、空白或选项注入；
   用户名请使用 `user` 字段或 OpenSSH 的 `user@host`，不要写进主机键名。
@@ -446,6 +491,10 @@ sshweave ping --count 4 --interval 0.5 database # TCP 延迟、成功率；不�
 sshweave sockets list
 sshweave sockets master database
 sshweave sockets flush                        # ssh -O exit，不只是删除 socket 文件
+sshweave cache list --json                    # 已实例化名称，不是 SSH 主机密钥
+sshweave cache remove worker-eu-42 --dry-run
+sshweave cache remove worker-eu-42
+sshweave cache clear --dry-run
 sshweave info
 sshweave completions zsh
 ```
@@ -454,20 +503,51 @@ sshweave completions zsh
 支持 `SSHWEAVE_CONFIG`、`SSHWEAVE_DEBUG` 和标准 `RUST_LOG`。
 wrapper 中程序名（ssh/scp/sftp/rsync）后的 `-v` 等参数透传给被包装程序，
 sshweave 的全局选项放在 wrapper 前。
-wrapper 管理 `-F`/rsync 远程 shell，不支持再传入冲突的配置文件或 rsync `-e`；
-rsync 的 `-e` 附加参数和组合短选项也会检查，合法的 rsync `-F` 则正常透传。
+wrapper 管理 `-F`、SSH 路由和 rsync 远程 shell。冲突的配置文件、SSH/SCP/SFTP 的
+`-J`、通过 `-o` 覆盖路由以及 rsync `-e`，都会在写入缓存/配置之前明确拒绝；
+`-Jjump`、`-vJjump` 等附加参数和组合短选项同样检查。
+请用 `gateways` 或 `target/gateway` 显式链代替 `-J`。
+合法的 rsync `-F` 正常透传，SSH 远程命令中的参数保持原样。
 更复杂的 OpenSSH/rsync 调用可使用生成文件与原生命令。
 ping 默认 4 次，`--count 0` 持续运行，Ctrl+C 输出已完成探测的统计；
 没有成功探测时返回失败。sockets 仅枚举真正的 Unix socket，忽略同目录普通文件；
 ControlPath 中的字面 `*`、`?`、`[]` 不作为 glob 展开，只有动态主机 token 用于匹配。
+
+### 管理已实例化主机缓存
+
+生成配置的展开上限为 4096 个去重后的具体目标，合并计算静态主机、字面 alias、
+已登记目标、网关和链组件；这不是模式规则数量的上限。登记新目标时，会持有
+注册表锁校验完整展开集合；超限操作明确报错，不会改变原有注册表。
+
+```sh
+sshweave cache list
+sshweave cache list --json
+sshweave cache remove old-worker old-worker/gateway --dry-run
+sshweave cache remove old-worker old-worker/gateway
+sshweave config build --write
+# 如需清空所有动态登记名称以恢复：
+sshweave cache clear --dry-run
+sshweave cache clear
+sshweave config build --write
+```
+
+删除按完整名称精确匹配，不支持模式；未知名称报错，不会部分应用。
+命令向 stdout 输出选中的名称，向 stderr 输出汇总。`--dry-run` 不创建文件、
+目录或锁文件，不获取文件锁，也不运行 hooks。
+实际删除只修改 `settings.known_hosts`；显式 build 或下一次 wrapper 才更新生成配置。
+静态主机及仍被其他路由引用的网关依然会出现在生成结果中；再次连接被删除的名称
+可能重新登记。不会自动淘汰已有名称。
+
+这些命令不修改 OpenSSH 主机密钥、源 TOML、私钥或控制套接字。
 
 ## 分层与维护
 
 ```text
 lib.rs       crate 总览与模块组织（可用 `cargo doc --open` 查看）
 main.rs      clap CLI、应用用例、子进程退出码
+wrapper.rs   仅供可执行文件使用的 SSH 兼容参数处理与进程调用
 config.rs    TOML 模型、include 装载、结构验证、继承
-resolver.rs  纯主机解析、模式/alias/capture、网关图验证、token
+resolver.rs  借用式预编译解析器、alias 索引、capture、网关图验证、token
 render.rs    确定性 OpenSSH / Graphviz 编译
 topology.rs  只读路由拓扑、完整候选路径展开、终端树形绘制
 store.rs     注册主机、文件锁、0600 临时文件、fsync + 原子替换
@@ -489,7 +569,13 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
+cargo test --doc --locked
+python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 scripts/check_docs.py
+go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/ci.yml .github/workflows/release.yml
 ```
+
+Python 3.11+ 只用于开发/发布脚本，工作流校验使用 Go；两者都不是应用运行时依赖。
 
 lint 策略位于 `Cargo.toml` 的 `[lints]`：公开项必须有文档注释，库和可执行文件禁止 `unsafe` 代码。
 
@@ -500,7 +586,59 @@ lint 策略位于 `Cargo.toml` 的 `[lints]`：公开项必须有文档注释，
 畸形/拒绝响应、超时、不绕过代理直连，以及代理与多级 SSH 跳板的组合。
 集成测试使用本地 TCP 和受控代理进程，不需要外部 SSH 服务器或登录凭据。
 CI 在 Linux/macOS 上分别使用 stable 和最低支持版本 Rust 1.88 执行上述检查。
+还会检查 Markdown 本地文件链接、发布脚本、工作流语法和解析性能预算。
+Actions 固定到提交哈希并由 Dependabot 更新；Cargo 缓存复用未变更的依赖，
+重复的分支/PR 运行会取消，但不会取消标签发布。
 外部跳板机认证、真实多级 SSH 会话和桌面通知仍需在实际部署环境验收。
+
+### 解析性能
+
+`Config::resolver()` 借用配置，一次性编译 regex/glob、建立字面 alias 索引，
+并在批量查询中复用继承结果。渲染、拓扑、列表和路由展开均使用预编译视图。
+原有 `Config::resolve()` API 保留；配置仍可在两次视图之间修改，修改后应新建
+解析器。没有跨进程持久缓存，因此 include 或环境变化不会被陈旧缓存掩盖。
+
+继承和网关图的记忆化保留循环及总深度检查；通过更长前缀访问已缓存子图时，
+仍会检查整条路径深度。匹配优先级、声明顺序及生成结果的确定性保持不变。
+
+```sh
+cargo build --release --locked
+python3 scripts/benchmark.py
+python3 scripts/benchmark.py --iterations 5 --max-regex-ms 250
+```
+
+基准使用临时配置和 HOME，预热一次后重复运行 CLI `config check`，以 JSON
+输出普通主机与正则规则的样本和中位数。CI 在 Linux runner 上对 180 条正则规则
+设置 250 ms 中位数预算，并保留报告。测量包含进程启动，本机结果受机器负载影响，
+不是生产环境 SLA。
+
+### 发布流程
+
+[发布工作流](../.github/workflows/release.yml) 为上述四个平台原生构建二进制。
+手动 `workflow_dispatch` 执行验证和打包，生成包含 `SHA256SUMS` 的
+`verified-release` 汇总制品，但**不会发布**。
+推送 `vVERSION` 标签时，会验证其与 `Cargo.toml` 版本完全一致，执行可复用 CI
+和各目标平台的测试，再打包二进制、文档与补全。
+
+发布前必须集齐四个平台压缩包及各自的 SHA-256 文件，并全部通过校验；
+随后生成 `SHA256SUMS`，创建带自动说明的 GitHub Release。预发布版本会标记为
+pre-release。仅发布作业拥有 `contents: write`，不会覆盖已有 release。
+该流程不执行 crates.io 发布、Apple 签名或公证。
+
+本地打包验证时，将 TARGET 替换为本机 Rust target：
+
+```sh
+cargo build --release --locked --target TARGET
+python3 scripts/release.py metadata
+python3 scripts/release.py package --target TARGET --binary target/TARGET/release/sshweave --output target/release-check
+```
+
+压缩包统一所有者、权限和时间戳；CI 使用提交时间戳，本地默认使用 Unix epoch 0。
+相同输入可得到可复现的打包结果，但不等同于编译器输出可复现。脚本本身从不上传。
+
+维护者应先更新版本及锁文件，完成手动发布演练，再创建并推送匹配的标签。
+普通构建、测试或本地打包均不会自动执行此操作。
+从 Actions 页面启动手动演练前，需先将工作流合并到仓库默认分支。
 
 ### 提交与推送
 

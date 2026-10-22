@@ -10,15 +10,18 @@ sshweave does not reimplement the SSH protocol.
 ## Contents
 
 - [Build and get started](#build-and-get-started)
+  - [Release archives](#release-archives)
 - [TOML configuration](#toml-configuration)
 - [Hooks](#hooks)
 - [Commands](#commands)
-- [Feature comparison with assh](#feature-comparison-with-assh)
+  - [Managing materialized targets](#managing-materialized-targets)
 - [Architecture and maintenance](#architecture-and-maintenance)
+  - [Resolver performance](#resolver-performance)
+  - [Releases](#releases)
 
 ## Build and get started
 
-Requirements: Rust 1.88+, a Unix system (macOS/Linux), and OpenSSH. Desktop
+Building from source requires Rust 1.88+, a Unix system (macOS/Linux), and OpenSSH. Desktop
 notifications also require `osascript` on macOS or `notify-send` on Linux.
 Ordinary connections do not depend on nc/socat.
 Run the build, installation, example-copying, and maintenance commands below from
@@ -48,6 +51,41 @@ sshweave wrapper scp file.txt database:/tmp/
 sshweave wrapper sftp database
 sshweave wrapper rsync -az source/ database:/srv/
 ```
+
+### Release archives
+
+[Published releases](https://github.com/mingcheng/sshweave/releases) can include
+`sshweave-VERSION-TARGET.tar.gz` and matching `.sha256` files for:
+
+| Target | Platform |
+| --- | --- |
+| `x86_64-unknown-linux-gnu` | Linux x86_64, built on Ubuntu 24.04 |
+| `aarch64-unknown-linux-gnu` | Linux ARM64, built on Ubuntu 24.04 |
+| `x86_64-apple-darwin` | macOS Intel, deployment target 13.0 |
+| `aarch64-apple-darwin` | macOS Apple Silicon, deployment target 13.0 |
+
+The binary still requires OpenSSH but not Rust, Python, or Go. Linux archives
+require a compatible glibc; use a source build on older systems or musl/Alpine.
+macOS archives are not Developer ID signed or notarized. Environments enforcing
+those requirements need an approved signing/distribution process or source
+installation; do not disable system security checks.
+
+Download the archive and its checksum from the same release. Replace `VERSION`
+and `TARGET` below with the selected values:
+
+```sh
+# Linux:
+sha256sum -c sshweave-VERSION-TARGET.tar.gz.sha256
+# macOS:
+shasum -a 256 -c sshweave-VERSION-TARGET.tar.gz.sha256
+tar -xzf sshweave-VERSION-TARGET.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 755 sshweave-VERSION-TARGET/sshweave "$HOME/.local/bin/sshweave"
+```
+
+Add `$HOME/.local/bin` to PATH if needed. Archives include this guide, the
+example TOML, the license, and Bash/Fish/Zsh completions. Install completion
+files in your shell's completion directory. `SHA256SUMS` covers all four archives.
 
 ### Shell aliases
 
@@ -272,6 +310,13 @@ ControlPath = "~/.config/sshweave/control/%C"
   first; that byte is preserved. If a proxy closes stdout without exiting, the
   startup timeout also bounds the wait for exit, so later routes are not blocked
   indefinitely.
+- A native direct TCP candidate also waits for the destination's first byte when
+  the target has more than one candidate route. EOF or timeout before that byte
+  tries the next candidate without forwarding any session data. One timeout
+  budget covers DNS, TCP establishment, and this probe; the byte is replayed.
+  A single native direct route retains general TCP behavior, including
+  client-first protocols and half-close. HTTP/SOCKS5 and command transports
+  retain their existing server-first startup probes even with one route.
 - With `control_master_mkdir = true`, missing ControlPath parent directories
   are created with mode 0700.
 - Target names accept ordinary DNS/IP/alias characters, not shell expressions,
@@ -512,6 +557,10 @@ sshweave ping --count 4 --interval 0.5 database # TCP latency/success; no gatewa
 sshweave sockets list
 sshweave sockets master database
 sshweave sockets flush                        # ssh -O exit, not just socket-file removal
+sshweave cache list --json                    # Materialized names, not SSH host keys
+sshweave cache remove worker-eu-42 --dry-run
+sshweave cache remove worker-eu-42
+sshweave cache clear --dry-run
 sshweave info
 sshweave completions zsh
 ```
@@ -521,9 +570,13 @@ Global options: `--config`/`-c`, `--verbose`/`-v`, and `--debug`.
 Arguments such as `-v` after the wrapped program name (ssh/scp/sftp/rsync)
 are passed to that program; put sshweave global options before `wrapper`.
 
-The wrapper manages `-F` and rsync's remote shell. Conflicting configuration
-files or rsync `-e` are unsupported; attached `-e` arguments and grouped short
-options are checked too. Valid rsync `-F` is passed through normally.
+The wrapper manages `-F`, SSH routing, and rsync's remote shell. Conflicting
+configuration files, SSH/SCP/SFTP `-J`, routing overrides through `-o`, and rsync
+`-e` are rejected before registry/configuration writes. Attached values such as
+`-Jjump` and grouped short options such as `-vJjump` are checked too.
+Use `gateways` or an explicit `target/gateway` chain instead of `-J`.
+Valid rsync `-F` is passed through normally; remote SSH command arguments remain
+untouched.
 For more complex OpenSSH/rsync invocations, use the generated file with native
 commands.
 
@@ -533,13 +586,45 @@ sockets lists only actual Unix sockets, ignoring ordinary files in the same
 directory. Literal `*`, `?`, and `[]` in ControlPath are not expanded as globs;
 only dynamic host tokens are used for matching.
 
+### Managing materialized targets
+
+The generated configuration has a 4096-target expansion limit, counting distinct
+configured names, literal aliases, registered targets, gateways, and chain
+components together. This is not a limit on the number of pattern rules.
+Registration validates the complete expanded set while holding the registry lock.
+An overflowing update reports an error and does not change the existing registry.
+
+```sh
+sshweave cache list
+sshweave cache list --json
+sshweave cache remove old-worker old-worker/gateway --dry-run
+sshweave cache remove old-worker old-worker/gateway
+sshweave config build --write
+# To recover by clearing all dynamically registered names:
+sshweave cache clear --dry-run
+sshweave cache clear
+sshweave config build --write
+```
+
+Removal uses exact names, not patterns; unknown names are errors and do not
+partially apply. Commands print selected names to stdout and a summary to stderr.
+`--dry-run` creates no files or directories and does not acquire file locks or run
+hooks. Removal changes only `settings.known_hosts`; use an explicit build or the
+next wrapper invocation to update the generated configuration. Configured hosts
+and gateways still required by other routes remain in generated output.
+Connecting to a removed name may register it again.
+
+These commands never edit OpenSSH host keys, source TOML, private keys, or control
+sockets. There is no automatic eviction of existing names.
+
 ## Architecture and maintenance
 
 ```text
 lib.rs       Crate overview and module wiring (see `cargo doc --open`)
 main.rs      clap CLI, application use cases, subprocess exit codes
+wrapper.rs   Binary-only SSH-compatible argument handling and process invocation
 config.rs    TOML model, include loading, validation, inheritance
-resolver.rs  Pure host resolution, patterns/aliases/captures, gateway validation, tokens
+resolver.rs  Borrowed compiled resolver, alias index, captures, gateway validation, tokens
 render.rs    Deterministic OpenSSH / Graphviz compilation
 topology.rs  Read-only route topology, full candidate expansion, terminal trees
 store.rs     Host registry, file locks, 0600 temporary files, fsync + atomic replacement
@@ -564,7 +649,14 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
+cargo test --doc --locked
+python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 scripts/check_docs.py
+go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/ci.yml .github/workflows/release.yml
 ```
+
+Python 3.11+ is used only for development/release tooling; workflow linting uses Go.
+Neither is an application runtime dependency.
 
 Lint policy lives in `Cargo.toml` (`[lints]`): public items must be documented,
 and `unsafe` code is forbidden in the library and binary.
@@ -580,8 +672,72 @@ and combinations of proxies with multiple SSH jump hosts.
 Integration tests use local TCP and controlled proxy processes, not external
 SSH servers or login credentials.
 CI runs these checks on Linux/macOS with stable Rust and the minimum supported
-Rust 1.88. External gateway authentication, real multihop SSH sessions, and
+Rust 1.88. It also checks local Markdown file links, release tooling, workflow
+syntax, and the resolver performance budget. Actions are pinned to commit hashes
+and updated by Dependabot; Cargo caches avoid rebuilding unchanged dependencies.
+Redundant branch/PR runs are cancelled without cancelling tag releases.
+External gateway authentication, real multihop SSH sessions, and
 desktop notifications still require validation in the deployment environment.
+
+### Resolver performance
+
+`Config::resolver()` borrows the configuration and compiles regex/glob rules,
+indexes literal aliases, and reuses inherited options for a batch of lookups.
+Rendering, topology, listing, and route expansion use the same compiled view.
+The existing `Config::resolve()` API remains available. Configuration fields
+remain editable between views; create a new resolver after editing. There is
+no persistent cache, so include/environment changes cannot be hidden by stale
+cross-process state.
+
+Inheritance and gateway memoization retain cycle checks and total depth limits,
+including when a cached subtree is reached through a longer prefix. Matching
+precedence, declaration order, and deterministic rendering are unchanged.
+
+```sh
+cargo build --release --locked
+python3 scripts/benchmark.py
+python3 scripts/benchmark.py --iterations 5 --max-regex-ms 250
+```
+
+The benchmark uses temporary configurations and HOME, one warmup, and repeated
+CLI `config check` invocations. JSON reports all samples and medians for literal
+hosts and regex rules. CI enforces a 250 ms median budget for 180 regex rules
+on its Linux runner and retains the report. Local measurements depend on the
+machine and include process startup; they are not a production SLA.
+
+### Releases
+
+[The release workflow](../.github/workflows/release.yml) builds native binaries
+for all four targets above. A manual `workflow_dispatch` run performs validation
+and packaging, including the combined `verified-release` artifact and
+`SHA256SUMS`, but **does not publish**. Pushing a `vVERSION` tag validates that
+it exactly matches `Cargo.toml`, runs the reusable CI checks and each platform's
+tests, then packages binaries, documentation, and completions.
+
+Before publishing, all four archives and individual SHA-256 files must be present
+and pass checksum verification. The workflow creates `SHA256SUMS`, then creates a
+GitHub Release with generated notes. Pre-release versions are marked accordingly.
+Only the publishing job has `contents: write`; existing releases are not
+overwritten. No crates.io publishing, Apple signing, or notarization is performed.
+
+For a local packaging check, replace `TARGET` with the native Rust target:
+
+```sh
+cargo build --release --locked --target TARGET
+python3 scripts/release.py metadata
+python3 scripts/release.py package --target TARGET --binary target/TARGET/release/sshweave --output target/release-check
+```
+
+Archives use normalized ownership, permissions, and timestamps; CI supplies the
+commit timestamp, and local packaging defaults to epoch zero. These metadata
+choices make packaging reproducible for identical inputs, not the compiler
+output itself. The scripts never upload anything.
+
+Maintainers should update the version and lockfile, complete a manual release
+rehearsal, then create and push the matching tag. This does not happen as part of
+ordinary builds, tests, or packaging.
+Merge the workflow onto the repository's default branch before starting a manual
+run from the Actions page.
 
 ### Commits and pushes
 

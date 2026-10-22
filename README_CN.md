@@ -1,18 +1,30 @@
-# sshweave
+<center>
+<img src="./sshweave.webp" width="250" alt="sshweave 标志">
+<h1>sshweave</h1>
+<p>少一些 SSH 配置负担，多一份连接从容。</p>
+<p>
+<a href="README.md">English</a> | 简体中文
+</p>
+</center>
 
-[English](README.md) | **简体中文**
+sshweave 帮助你在基础设施不断扩展时，有序管理 SSH 主机与连接路径。
+集中维护共用设置，轻松访问私有网络中的主机，并继续使用熟悉的工具。
 
-**少一些 SSH 配置负担，多一份连接从容。**
-
-sshweave 帮助你在基础设施不断扩展时，有序管理 SSH 主机与连接路径。集中维护共用设置，轻松访问私有网络中的主机。
+sshweave 使用 Rust 编写，将 TOML 配置转换为 OpenSSH 配置，并提供
+`ProxyCommand` 传输。它不重新实现 SSH 协议：认证、主机密钥验证及会话
+仍由 OpenSSH 处理，远程主机无需安装 sshweave 代理程序。
 
 ## 为什么选择 sshweave？
 
-- **减少重复维护：** 在主机和环境之间复用共用设置，不必反复复制配置。
-- **简化主机访问：** 用易记的名称访问主机，统一管理成组的机器，包括动态命名的主机。
-- **灵活选择路径：** 支持直连、跳板机和网络代理，连接失败时可尝试备用路径。
-- **连接路径更清晰：** 在连接之前预览到达目标主机的路线。
-- **保留熟悉的工作流：** 继续使用 SSH、SCP、SFTP 和 rsync，由 OpenSSH 处理认证与主机验证。
+- **减少重复维护：** 在主机之间共享默认值、模板和继承设置，通过 includes
+  将配置拆分为可复用的 TOML 文件。
+- **简化主机访问：** 使用别名、glob 模式和正则表达式，统一管理固定主机与动态命名的机器。
+- **灵活选择路径：** 组合直连、SSH 跳板机及 HTTP CONNECT/SOCKS5 代理，
+  支持备用路径或固定的多跳链路。
+- **连接路径更清晰：** 查看解析后的设置，在终端中预览完整连接路径，无需实际连接。
+- **保留熟悉的工作流：** 通过 wrapper 或 OpenSSH `Include` 继续使用 SSH、SCP、
+  SFTP 和 rsync。
+- **运维工具：** 配置生命周期 hooks、限制单条连接的流量速率，并管理 OpenSSH 多路复用套接字。
 - **配置始终可控：** 管理生成的配置，不自动覆盖你手写的 SSH 配置。
 
 ## 适合谁？
@@ -21,17 +33,124 @@ sshweave 帮助你在基础设施不断扩展时，有序管理 SSH 主机与连
 
 ## 开始使用
 
-[`sshweave` crate](https://crates.io/crates/sshweave) 提供名为 `sshweave` 的二进制命令行程序。通过 Cargo 安装
-（需要 Rust 1.88+）：
+### 安装
+
+运行环境要求：macOS 或 Linux，并已安装 OpenSSH。使用 rsync wrapper 时，
+还需要单独安装 `rsync`。
+
+[`sshweave` crate](https://crates.io/crates/sshweave) 提供名为 `sshweave` 的命令行程序。
+通过 Cargo 安装（需要 Rust 1.88+）：
 
 ```sh
 cargo install sshweave --locked
 sshweave --help
 ```
 
-运行环境要求：macOS 或 Linux，并已安装 OpenSSH。
+标签发布流程也会构建 macOS/Linux 的 x86_64、ARM64 压缩包，包含 SHA-256 校验和、
+文档及 shell 补全。已发布制品见 [GitHub Releases](https://github.com/mingcheng/sshweave/releases)，
+平台要求及校验方法见 [发布包安装说明](examples/README_CN.md#发布包安装)。
+运行发布包中的二进制程序无需安装 Rust。
 
-安装、配置示例和日常用法请参阅 **[配置与使用指南](examples/README.zh-CN.md)**。也可阅读 [English guide](examples/README.md)。
+### 配置主机
+
+创建配置目录：
+
+```sh
+mkdir -p ~/.config/sshweave
+```
+
+将以下内容保存为 `~/.config/sshweave/sshweave.toml`；如果已有配置，请合并而非覆盖。
+连接前，先将示例中的域名、地址和用户名替换为自己的实际值。
+
+```toml
+[defaults]
+user = "deploy"
+connect_timeout = 3
+
+[hosts.bastion]
+hostname = "bastion.example.net"
+user = "ops"
+
+[hosts.database]
+hostname = "10.0.0.10"
+gateways = ["direct", "bastion"]
+gateway_strategy = "sequential"
+```
+
+此配置先尝试直连数据库，再尝试通过跳板机连接。默认网关策略是 `random`；
+需要固定尝试顺序时，应显式设置 `sequential`。若要按固定链路依次经过每个跳板机，
+使用 `chain`，并仅列出 SSH 网关名称，不包含 `direct`；
+详见[网关与故障切换](examples/README_CN.md#网关与故障切换)。
+
+### 验证并连接
+
+```sh
+sshweave config check
+sshweave topology database
+sshweave config build --write
+sshweave wrapper ssh database
+```
+
+`config check` 验证配置，不检查远程主机是否可达。`topology` 仅预览路径，
+不会建立连接或执行 hooks、命令。`config build --write` 默认写入
+`~/.config/sshweave/sshweave.conf`；不加 `--write` 时输出到 stdout。
+
+wrapper 在 OpenSSH 读取配置**之前**更新生成文件，让新匹配的主机和配置变更
+在第一次连接尝试时即可生效。此工作流无需修改 `~/.ssh/config`。
+
+wrapper 通过 `-F` 选择生成文件，而不是加载通常使用的 `~/.ssh/config`；
+请在 TOML 中配置所需的主机设置。若需合并生成配置与手写配置，或直接用于
+基于 OpenSSH 的 Git/GUI 应用，请参阅[OpenSSH Include 接入说明](examples/README_CN.md#日常接入)。
+
+使用其他 TOML 文件时，可设置 `SSHWEAVE_CONFIG`，或在子命令之前传入 `-c`，
+例如 `sshweave -c ./sshweave.toml wrapper ssh database`。
+
+## 日常使用
+
+在被包装的程序名之后传入该程序的参数与远程命令：
+
+```sh
+sshweave wrapper ssh -v database uname -a
+sshweave wrapper scp file.txt database:/tmp/
+sshweave wrapper sftp database
+sshweave wrapper rsync -az source/ database:/srv/
+```
+
+sshweave 自身的选项放在 `wrapper` 之前，例如
+`sshweave --debug wrapper ssh database`。wrapper 负责 SSH 配置与路由，
+因此会拒绝 SSH `-F`/`-J`、rsync `-e` 等冲突选项；请改为在 TOML 中配置 `gateways`。
+
+| 用途 | 命令 |
+| --- | --- |
+| 列出主机、别名和模式 | `sshweave config list` |
+| 查看解析后的主机 | `sshweave config resolve database` |
+| 以 JSON 预览路由，不建立连接 | `sshweave connect database --dry-run` |
+| 列出 OpenSSH 控制套接字（需配置 `ssh.ControlPath`） | `sshweave sockets list` |
+| 列出已实例化的目标名称，而非 SSH 主机密钥 | `sshweave cache list` |
+| 查看版本、路径和配置统计 | `sshweave info` |
+| 生成 Zsh 补全 | `sshweave completions zsh` |
+
+更多命令及 wrapper 限制见[命令参考](examples/README_CN.md#命令)；
+也可参考 [shell 别名示例](examples/README_CN.md#日常接入)，继续使用熟悉的命令名称。
+
+## 重要行为说明
+
+- **配置归属：** sshweave 只覆盖带有自身标记的生成文件，不会自动编辑
+  `~/.ssh/config`、移动私钥或替换 OpenSSH 的 `known_hosts` 数据库。
+- **故障切换范围：** 仅在传输建立阶段、收到目标的第一个字节之前尝试备用路径。
+  sshweave 不会恢复已中断的 SSH 会话，也不会因 SSH 认证失败而重试其他路径。
+- **代理支持：** HTTP CONNECT 和 SOCKS5 目前仅支持无需认证的代理；
+  已配置的代理不会被静默绕过而改为直连。
+- **配置可信性：** hooks 和运行时命令可以执行程序，请只加载可信的配置文件。
+
+## 文档
+
+- **[配置与使用指南](examples/README_CN.md)：** 安装、继承、路由、代理、hooks、命令与维护。
+- **[完整示例配置](examples/sshweave.toml)：** 在同一个 TOML 文件中展示模板、模式、
+  网关策略、具名代理和 hooks。
+- **[English guide](examples/README.md)：** 英文配置与使用指南。
+
+文档以英文版本为准，中文版本同步相同内容。
 
 ## 致谢与许可
 
