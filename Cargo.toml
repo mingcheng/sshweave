@@ -1,6 +1,6 @@
 [package]
 name = "sshweave"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Command-line tool for composable SSH configuration and resilient gateway routing"
@@ -28,7 +28,7 @@ hostname = "0.4"
 indexmap = { version = "2", features = ["serde"] }
 minijinja = { version = "3", features = ["builtins", "json", "serde"] }
 ptree = { version = "0.5", default-features = false, features = ["ansi"] }
-rand = "0.9"
+rand = "0.10"
 regex = "1"
 rustix = { version = "1", features = ["process"] }
 serde = { version = "1", features = ["derive"] }

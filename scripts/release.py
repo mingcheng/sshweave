@@ -1,4 +1,4 @@
-"""Build and verify versioned release archives; never uploads or publishes."""
+"""Build and verify release artifacts, publish to GitHub, and check crates.io."""
 
 import argparse
 import gzip
@@ -13,6 +13,8 @@ import sys
 import tarfile
 import tempfile
 import tomllib
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = (
@@ -25,6 +27,7 @@ DOCUMENTS = (
     "LICENSE",
     "README.md",
     "README_CN.md",
+    "sshweave.webp",
     "examples/README.md",
     "examples/README_CN.md",
     "examples/sshweave.toml",
@@ -153,6 +156,88 @@ def verify(root, directory):
     return sums
 
 
+def github(*arguments):
+    return subprocess.run(
+        ["gh", *arguments],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        text=True,
+        timeout=300,
+        check=True,
+    ).stdout
+
+
+def publish(root, directory, tag, repository):
+    information = metadata(root, tag)
+    verify(root, directory)
+    files = sorted(path.resolve() for path in directory.iterdir())
+    expected = {path.name: f"sha256:{digest(path)}" for path in files}
+    pages = json.loads(
+        github("api", "--paginate", "--slurp", f"repos/{repository}/releases?per_page=100")
+    )
+    matches = [item for page in pages for item in page if item["tag_name"] == tag]
+    if len(matches) > 1:
+        raise ValueError(f"multiple GitHub releases found for {tag}")
+    existing = matches[0] if matches else None
+    if existing is not None and not existing["draft"]:
+        actual = {asset["name"]: asset.get("digest") for asset in existing["assets"]}
+        if (
+            actual != expected
+            or any(asset["state"] != "uploaded" for asset in existing["assets"])
+            or existing["prerelease"] != information["prerelease"]
+        ):
+            raise ValueError(f"published release {tag} differs from verified artifacts; refusing to overwrite")
+        return existing["html_url"]
+    options = ["--repo", repository]
+    prerelease = f"--prerelease={str(information['prerelease']).lower()}"
+    if existing is None:
+        github(
+            "release", "create", tag, *options,
+            "--verify-tag", "--generate-notes", "--title", tag, "--draft", prerelease,
+        )
+    else:
+        extra = {asset["name"] for asset in existing["assets"]} - expected.keys()
+        if extra:
+            raise ValueError(f"unexpected draft release assets: {', '.join(sorted(extra))}")
+    github("release", "upload", tag, *options, "--clobber", *(str(path) for path in files))
+    github("release", "edit", tag, *options, "--verify-tag", "--draft=false", prerelease)
+    return github("release", "view", tag, *options, "--json", "url", "--jq", ".url").strip()
+
+
+def crate_status(root, directory, tag):
+    version = metadata(root, tag)["version"]
+    checksum = digest(directory / f"sshweave-{version}.crate")
+    status = {"version": version, "published": False}
+    request = Request(
+        "https://index.crates.io/ss/hw/sshweave",
+        headers={
+            "User-Agent": "sshweave-release (https://github.com/mingcheng/sshweave)",
+            "Cache-Control": "no-cache",
+        },
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            entries = [json.loads(line) for line in response.read().splitlines() if line.strip()]
+    except HTTPError as error:
+        error.close()
+        if error.code != 404:
+            raise
+        return status
+    if not entries or any(entry["name"] != "sshweave" for entry in entries):
+        raise ValueError("invalid crates.io index for sshweave")
+    matches = [entry for entry in entries if entry["vers"] == version]
+    if len(matches) > 1:
+        raise ValueError(f"duplicate crates.io index entries for sshweave {version}")
+    if matches:
+        entry = matches[0]
+        if entry["yanked"]:
+            raise ValueError(f"crates.io version {version} is yanked")
+        if entry["cksum"] != checksum:
+            raise ValueError(f"crates.io checksum mismatch for sshweave {version}; refusing to overwrite")
+        status["published"] = True
+    return status
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -166,6 +251,14 @@ def main():
     archive.add_argument("--epoch", type=int, default=0)
     verification = commands.add_parser("verify", help="require and checksum all four platform archives")
     verification.add_argument("--directory", type=Path, default=Path("dist"))
+    publication = commands.add_parser("publish", help="publish verified archives to GitHub using gh")
+    publication.add_argument("--tag", required=True)
+    publication.add_argument("--repo", required=True)
+    publication.add_argument("--directory", type=Path, default=Path("dist"))
+    crate = commands.add_parser("crate-status", help="check an existing crates.io version against the local package")
+    crate.add_argument("--tag", required=True)
+    crate.add_argument("--directory", type=Path, default=Path("target/package"))
+    crate.add_argument("--github-output", type=Path)
     args = parser.parse_args()
     if args.command == "metadata":
         value = metadata(ROOT, args.tag)
@@ -176,8 +269,16 @@ def main():
         print(json.dumps(value))
     elif args.command == "package":
         print(package(ROOT, args.binary, args.target, args.output, args.epoch))
-    else:
+    elif args.command == "verify":
         print(verify(ROOT, args.directory))
+    elif args.command == "crate-status":
+        value = crate_status(ROOT, args.directory, args.tag)
+        if args.github_output is not None:
+            with args.github_output.open("a", encoding="utf-8") as output:
+                output.write(f"published={str(value['published']).lower()}\n")
+        print(json.dumps(value))
+    else:
+        print(publish(ROOT, args.directory, args.tag, args.repo))
 
 
 if __name__ == "__main__":
