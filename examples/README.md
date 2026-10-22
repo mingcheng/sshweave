@@ -2,69 +2,74 @@
 
 **English** | [简体中文](README_CN.md) · [Product overview](../README.md)
 
-This guide covers installation, configuration, routing, commands, and maintenance.
-sshweave compiles configuration, selects routes, and transports byte streams.
-System OpenSSH handles authentication, host-key verification, and sessions;
-sshweave does not reimplement the SSH protocol.
+This guide covers configuring hosts, choosing routes, and using sshweave with
+SSH, SCP, SFTP, and rsync. OpenSSH handles authentication and host-key verification.
 
 ## Contents
 
-- [Build and get started](#build-and-get-started)
+- [Contents](#contents)
+- [Install and get started](#install-and-get-started)
   - [Release archives](#release-archives)
+- [Daily use](#daily-use)
+  - [Shell aliases](#shell-aliases)
+  - [OpenSSH Include and automatic updates](#openssh-include-and-automatic-updates)
 - [TOML configuration](#toml-configuration)
+  - [Loading, inheritance, and matching](#loading-inheritance-and-matching)
+  - [SSH options and runtime commands](#ssh-options-and-runtime-commands)
+- [Gateways and failover](#gateways-and-failover)
+  - [Terminal route topology (no connection)](#terminal-route-topology-no-connection)
+  - [Standalone HTTP / SOCKS5 proxies](#standalone-http--socks5-proxies)
+  - [Timeouts and rate limits](#timeouts-and-rate-limits)
 - [Hooks](#hooks)
 - [Commands](#commands)
+  - [Connection sharing](#connection-sharing)
   - [Managing materialized targets](#managing-materialized-targets)
-- [Architecture and maintenance](#architecture-and-maintenance)
-  - [Resolver performance](#resolver-performance)
-  - [Releases](#releases)
 
-## Build and get started
+## Install and get started
 
-Building from source requires Rust 1.88+, a Unix system (macOS/Linux), and OpenSSH. Desktop
-notifications also require `osascript` on macOS or `notify-send` on Linux.
-Ordinary connections do not depend on nc/socat.
-Run the build, installation, example-copying, and maintenance commands below from
-the repository root, not from the examples directory.
+Use macOS or Linux with OpenSSH installed. Install `rsync` separately if needed.
+To install with Cargo, Rust 1.88+ is required:
 
 ```sh
-cargo build --release --locked
-cargo install --path . --locked
+cargo install sshweave --locked
+```
+
+From a local source checkout, use `cargo install --path . --locked` at the
+repository root instead. To install without Rust, use a [release archive](#release-archives).
+
+Create the configuration directory:
+
+```sh
 mkdir -p ~/.config/sshweave
-cp examples/sshweave.toml ~/.config/sshweave/sshweave.toml
-# First adapt the example domains, usernames, and key paths to your environment.
+```
+
+Save [sshweave.toml](sshweave.toml) as `~/.config/sshweave/sshweave.toml`, or merge
+it into an existing configuration. Replace the example domains, addresses,
+usernames, and key paths before connecting. Then validate, preview, and connect:
+
+```sh
 sshweave config check
+sshweave topology database
 sshweave config build --write
 sshweave wrapper ssh database
 ```
 
-Use `sshweave wrapper ssh` for the recommended workflow: it resolves patterns,
-instantiates gateway chains, creates control-socket directories, and updates
-configuration **before** OpenSSH reads it. SSH arguments, remote commands, and
-exit codes are passed through.
-
-```sh
-sshweave wrapper ssh -p 2222 -v database uname -a
-sshweave wrapper ssh worker-eu-42
-sshweave wrapper ssh database/bastion/outer-gateway
-sshweave wrapper scp file.txt database:/tmp/
-sshweave wrapper sftp database
-sshweave wrapper rsync -az source/ database:/srv/
-```
+Run `config check` after editing configuration. It checks configuration, not
+remote availability; `topology` is also an offline preview.
 
 ### Release archives
 
 [Published releases](https://github.com/mingcheng/sshweave/releases) can include
 `sshweave-VERSION-TARGET.tar.gz` and matching `.sha256` files for:
 
-| Target | Platform |
-| --- | --- |
-| `x86_64-unknown-linux-gnu` | Linux x86_64, built on Ubuntu 24.04 |
-| `aarch64-unknown-linux-gnu` | Linux ARM64, built on Ubuntu 24.04 |
-| `x86_64-apple-darwin` | macOS Intel, deployment target 13.0 |
-| `aarch64-apple-darwin` | macOS Apple Silicon, deployment target 13.0 |
+| Target                      | Platform                                    |
+| --------------------------- | ------------------------------------------- |
+| `x86_64-unknown-linux-gnu`  | Linux x86_64, built on Ubuntu 24.04         |
+| `aarch64-unknown-linux-gnu` | Linux ARM64, built on Ubuntu 24.04          |
+| `x86_64-apple-darwin`       | macOS Intel, deployment target 13.0         |
+| `aarch64-apple-darwin`      | macOS Apple Silicon, deployment target 13.0 |
 
-The binary still requires OpenSSH but not Rust, Python, or Go. Linux archives
+The binary still requires OpenSSH but not Rust. Linux archives
 require a compatible glibc; use a source build on older systems or musl/Alpine.
 macOS archives are not Developer ID signed or notarized. Environments enforcing
 those requirements need an approved signing/distribution process or source
@@ -85,72 +90,70 @@ install -m 755 sshweave-VERSION-TARGET/sshweave "$HOME/.local/bin/sshweave"
 
 Add `$HOME/.local/bin` to PATH if needed. Archives include this guide, the
 example TOML, the license, and Bash/Fish/Zsh completions. Install completion
-files in your shell's completion directory. `SHA256SUMS` covers all four archives.
+files in your shell's completion directory.
+
+## Daily use
+
+The recommended wrapper workflow updates configuration **before** OpenSSH reads
+it and passes through program arguments, remote commands, and exit codes:
+
+```sh
+sshweave wrapper ssh -p 2222 -v database uname -a
+sshweave wrapper scp file.txt database:/tmp/
+sshweave wrapper sftp database
+sshweave wrapper rsync -az source/ database:/srv/
+```
+
+The wrapper uses the generated file with `-F`, not your usual `~/.ssh/config`.
+Put required host settings in TOML, or use the [Include workflow](#openssh-include-and-automatic-updates)
+to combine generated and hand-written configuration.
+
+Arguments after the program name belong to that program: SSH uses `-p` for a
+port, while SCP/SFTP use `-P`. Put sshweave options before `wrapper`, for example
+`sshweave --debug wrapper ssh database`; use `sshweave help wrapper` for help.
+
+The wrapper manages SSH configuration, routing, and rsync's remote shell.
+Conflicting SSH/SCP/SFTP `-F`/`-J`, routing overrides through `-o`, and rsync
+`-e`/`--rsh` are rejected. Use TOML `gateways` or a `target/gateway` chain instead
+of `-J`. For other configuration or routing overrides, use native commands with
+the generated file.
 
 ### Shell aliases
 
-Optionally add these aliases to Bash/Zsh to keep using familiar commands:
+Optionally add these aliases to `~/.bashrc` or `~/.zshrc`:
 
 ```sh
-# Add to ~/.bashrc or ~/.zshrc; macOS Bash login shells can source ~/.bashrc
-# from ~/.bash_profile.
 alias ssh='sshweave wrapper ssh'
 alias scp='sshweave wrapper scp'
 alias sftp='sshweave wrapper sftp'
 alias rsync='sshweave wrapper rsync'
-
-ssh -p 2222 -v database uname -a
-ssh database/bastion/outer-gateway
-scp -P 2222 file.txt database:/tmp/
-sftp -P 2222 database
-rsync -az source/ database:/srv/
-
-# Bypass the alias temporarily and invoke the original program.
-command ssh database
-command scp file.txt database:/tmp/
-command sftp database
-command rsync -az source/ database:/srv/
 ```
 
-For a custom configuration, set
-`export SSHWEAVE_CONFIG="$HOME/.config/sshweave/sshweave.toml"`; all aliases above
-will use it. Alternatively, use
-`alias ssh='sshweave -c /absolute/path/sshweave.toml wrapper ssh'`.
-The other aliases can likewise put `-c /absolute/path/sshweave.toml` before
-`wrapper`.
-
-Arguments after the program name belong to that program: SSH uses `-p` for a
-port, while SCP/SFTP use `-P`. After `wrapper ssh`, `-v`, `-c`, `-V`, and `-h`
-belong to OpenSSH, not sshweave. Put sshweave options before `wrapper`;
-use `sshweave help wrapper` for wrapper help.
-
-The wrapper directly launches `settings.ssh_binary` (default: `ssh` from PATH),
-or `scp` / `sftp` / `rsync` from PATH, without a shell, so aliases are not
-expanded again. Aliases affect only the current shell, not SSH calls made by
-Git or GUI applications. For those applications, use the Include setup below.
+Then use `ssh database`, `scp file.txt database:/tmp/`, and similar commands.
+Use `command ssh database` to bypass an alias temporarily. Bash login shells may
+need to source `~/.bashrc` from `~/.bash_profile`.
+Set `SSHWEAVE_CONFIG` if the aliases should use a custom TOML file.
+Aliases affect only the current shell, not Git or GUI applications.
 
 ### OpenSSH Include and automatic updates
 
-You can also add this at the top of your **hand-maintained** `~/.ssh/config`:
+After `sshweave config build --write`, add this near the top of your
+**hand-maintained** `~/.ssh/config`:
 
 ```sshconfig
 Include ~/.config/sshweave/sshweave.conf
 ```
 
-Then use `ssh`, `scp`, `sftp`, `rsync`, or OpenSSH-based Git/GUI applications
-directly. OpenSSH uses the first effective value, so Include placement affects
-precedence. The generated file ends with a `Host *` block enabling sshweave's
-ProxyCommand for any destination. Put hand-written settings requiring a special
-proxy before the Include, or use a dedicated configuration with `ssh -F`.
+This enables native SSH/SCP/SFTP/rsync and OpenSSH-based Git/GUI applications.
+OpenSSH uses the first effective value, so Include placement affects precedence.
+The generated `Host *` applies sshweave routing to unlisted destinations too.
+Put hand-written settings requiring a different proxy before the Include, or use
+a dedicated configuration with `ssh -F`.
 
-**Automatic-update boundary:** when ProxyCommand runs, the outer OpenSSH process
-has already read its configuration. After a configuration change, or on first
-use of a new glob/regex host or `host/gateway` chain, sshweave atomically updates
-the file and explicitly asks you to rerun SSH rather than continuing with stale
-authentication settings. The wrapper avoids this retry.
-`--no-rewrite` / `automatic_rewrite = false` disables ProxyCommand's automatic
-updates; explicit builds and wrapper invocations still generate up-to-date
-configuration as required.
+After configuration changes or the first use of a new pattern/chain target,
+this workflow may update the generated file and ask you to rerun SSH. The wrapper
+avoids that retry. Setting `settings.automatic_rewrite = false` disables these
+automatic updates; explicit builds and wrappers still refresh configuration.
 
 sshweave only overwrites generated files carrying its own marker. It **does not
 automatically modify your hand-written `~/.ssh/config`**.
@@ -161,34 +164,26 @@ stdout into the same file being read or managed.
 
 See [sshweave.toml](sshweave.toml) for a complete working configuration structure.
 
-The default configuration file is `$HOME/.config/sshweave/sshweave.toml`.
-Generated OpenSSH configuration, the instantiated-host cache, lock files, and
-atomic-write temporary files live under `$HOME/.config/sshweave/`.
-The example also stores control sockets in its `control/` subdirectory.
-`-c` / `SSHWEAVE_CONFIG` overrides the configuration file location;
-`settings.output`, `settings.known_hosts`, and SSH `ControlPath` can still
-explicitly point elsewhere. Relative configuration paths are resolved against
-the TOML file's directory.
+The default file is `~/.config/sshweave/sshweave.toml`. Use `-c` before the
+subcommand or set `SSHWEAVE_CONFIG` to select another file. Relative
+configuration paths resolve from the TOML file's directory.
 
-Old locations are not migrated automatically. Move existing configuration
-manually and update explicit paths and the Include in `~/.ssh/config`.
-SSH private keys and OpenSSH's own `known_hosts` stay in their original locations.
+`~/.config/sshweave/conf.d/*.toml` is always loaded, even with a custom root file;
+the directory may be empty or absent. Use `includes` for other files.
+Generated configuration and the target cache use the paths below by default.
+Update your OpenSSH Include if you change `settings.output`.
 
-`${HOME}/.config/sshweave/conf.d/*.toml` is loaded automatically without an
-includes declaration. This path is added to the root configuration's effective
-includes list, visible with `config json`. This fixed directory is loaded even
-when using `-c` / `SSHWEAVE_CONFIG`; a missing directory or no matches is allowed.
+The following examples are configuration fragments. Add them to your file or
+merge them into existing tables; do not duplicate TOML table headers.
 
 ```toml
-# Optional: additional configuration outside the default conf.d directory.
-includes = ["extra.d/*.toml", "${HOME}/.config/sshweave/shared.toml"]
+# includes = ["extra.d/*.toml"]
 
 [settings]
 output = "~/.config/sshweave/sshweave.conf"
 known_hosts = "~/.config/sshweave/sshweave_known_hosts.json"
 ssh_binary = "ssh"
 automatic_rewrite = true
-# binary = "/absolute/path/to/sshweave"  # Defaults to the current executable's absolute path.
 
 [defaults]
 user = "${USER}"
@@ -202,14 +197,14 @@ user = "deploy"
 IdentityFile = ["~/.ssh/id_ed25519", "~/.ssh/company_key"]
 IdentitiesOnly = true
 
-[hosts.gateway]
-hostname = "gateway.example.net"
+[hosts.bastion]
+hostname = "bastion.example.net"
 aliases = ["gate"]
 
 [hosts.database]
 inherits = ["production"]
 hostname = "10.0.0.10"
-gateways = ["direct", "gateway"]
+gateways = ["direct", "bastion"]
 gateway_strategy = "sequential"
 rate_limit = "5 MiB/s"
 
@@ -219,46 +214,38 @@ LocalForward = ["8080 localhost:80", "9090 localhost:90"]
 
 ### Loading, inheritance, and matching
 
-- Includes are relative to the including file and support glob patterns, `~`,
-  and `${VAR}`. Matches are sorted and deduplicated by canonical path.
-  The default conf.d may be empty; other unmatched includes, missing files,
-  cycles, and invalid TOML are errors.
-- Entries with the same name merge by field: root file > later include >
-  earlier include. The default conf.d is prepended, so explicit includes can
-  override it. If explicitly declared, that default path keeps its declared
-  position. Within conf.d, files are sorted by name and later files take
-  precedence. Only the root file supplies settings; other files supply
-  defaults/templates/hosts/proxies/includes.
-- Inheritance can be nested, with a protective depth limit of 64:
-  the host itself > first parent > subsequent parents. Templates are searched
-  before hosts; use `template:name` / `host:name` to disambiguate.
-  Cycles and missing parents are errors; unused templates are validated too.
-- Host resolution: exact host name > exact alias > glob/regex matches in
-  declaration order > defaults. Later matches only fill unset fields.
-  Templates are not directly connectable hosts. Undeclared ordinary host names
-  can still connect directly with defaults applied.
+- Includes support glob patterns, `~`, and `${VAR}`. Files are sorted by name.
+  Unlike the default conf.d, explicit include patterns must match existing files.
+  Only the root file supplies `[settings]`.
+- Same-name entries merge by field: root file > later include > earlier include.
+  The automatic conf.d is loaded before explicit includes unless you list it
+  yourself at a different position.
+- Inheritance: host settings > first parent > subsequent parents. Parents may
+  inherit too. Templates are searched before hosts; use `template:name` or
+  `host:name` to disambiguate. Missing parents and cycles are errors.
+- Matching: exact host > exact alias > glob/regex rules in declaration order >
+  defaults. Later matches only fill unset fields. Unlisted names still use
+  defaults; templates are not directly connectable hosts.
 - Globs support `*`, `?`, and character sets. Regexes require an explicit
   `regex:` prefix and must match the entire name. A regex hostname can use
   `{1}`, `{2}`, and `{named_capture}` substitutions.
-- `aliases` are entry names for a host and are not inherited. Without a
-  hostname, a literal alias points to the canonical host name; a pattern rule
-  uses the input name.
+- `aliases` are not inherited. Without `hostname`, a literal alias points to
+  the host's configured name; a pattern rule uses the requested name.
 - Lists replace rather than append: a child's `ssh.IdentityFile` replaces the
   parent's list. `gateways = []` disables inherited gateways; `[]` for a hook
-  event disables that event. SSH option names are case-insensitive, and
-  case-variant duplicates within an entry are errors.
-- Validation, export, and resolution do not run commands. `${VAR}` expands in
-  paths, hostname, user, SSH options, and runtime command arguments; missing
-  variables are errors. `$VAR` is left untouched to avoid interfering with shell
-  commands. `~otheruser` is unsupported.
+  event disables that event.
+- `${VAR}` expands in paths, hostname, user, SSH options, and command arguments;
+  missing variables are errors. `$VAR` is left for shell commands.
+  `~otheruser` is unsupported.
 
 ```toml
 [hosts."*.dev"]
 hostname = "%n.example.net"
 
-[hosts."regex:^db-(?P<region>[a-z]+)-([0-9]+)$"]
-hostname = "{region}-{2}.internal"
-user = "dbadmin"
+[hosts."regex:^worker-(?P<region>[a-z]+)-([0-9]+)$"]
+inherits = ["production"]
+hostname = "worker-{2}.{region}.internal"
+gateways = ["bastion"]
 ```
 
 ### SSH options and runtime commands
@@ -269,68 +256,38 @@ or string arrays (one directive per item). Use a comma-separated string for
 algorithm lists and arrays for repeatable options such as `IdentityFile` and
 `LocalForward`.
 
-Strings are OpenSSH **argument expressions**. Quote paths containing spaces
-using OpenSSH syntax, for example `IdentityFile = '"~/.ssh/company key"'`.
-Newlines and NUL characters cannot inject additional directives.
-sshweave does not maintain an SSH-option allowlist that could become outdated;
-the local OpenSSH installation checks unknown options.
-`Host`, `Match`, and `Include` are not allowed in ssh tables.
-Use typed fields for Hostname/User/Port, runtime fields and gateways for
-ProxyCommand/ProxyJump, and `connect_timeout` for ConnectTimeout
-(passed to both OpenSSH and the proxy runtime).
+Quote paths containing spaces using OpenSSH syntax, for example
+`IdentityFile = '"~/.ssh/company key"'`. Option names are case-insensitive;
+duplicates are errors. Your installed OpenSSH determines which options it supports.
+Do not put `Host`, `Match`, or `Include` in SSH tables. Use `hostname`, `user`,
+`port`, and `connect_timeout` for those settings, and `gateways`, `proxy`, or
+`proxy_command` for routing rather than SSH `ProxyJump`/`ProxyCommand`.
+
+For dynamic addresses or a custom transport, optionally configure command arrays:
 
 ```toml
 [hosts.dynamic]
 resolve_command = ["my-inventory", "address", "%n"]
 connect_timeout = 10
 proxy_command = ["nc", "%h", "%p"]
-control_master_mkdir = true
-
-[hosts.dynamic.ssh]
-ControlMaster = "auto"
-ControlPath = "~/.config/sshweave/control/%C"
 ```
 
-- `resolve_command` is an argv array, executed without a shell. Its stdout must
-  contain exactly one hostname/IP. Nonzero exit, invalid UTF-8, empty output,
-  multiple hosts, and timeout are errors.
-- `proxy_command` is also an argv array. It runs locally for direct connections
-  or as a remote command on the gateway, with shell-quoted arguments. Choose
-  nc, socat, or a custom transport explicitly. Without it, native TCP / `ssh -W`
-  is used without implicitly trying additional tools.
-- Command arguments support `%h` (resolved hostname), `%n` (original target),
-  `%p`, `%r`, `%g` (current gateway), `%u`, `%i` (local UID), `%d`, `%l`, `%L`,
-  `%C`, and `%%`. ControlPath supports the same local-host tokens.
-  `%C` uses OpenSSH's SHA-1 combination. Ordinary ssh options rendered for
-  OpenSSH retain OpenSSH's own token semantics.
-- `connect_timeout` is in seconds, defaults to 10, and can be disabled with 0.
-  It covers TCP connection establishment (including DNS), resolve_command, and
-  proxy startup. A proxy process is considered established only after receiving
-  the destination's first byte, suitable for SSH services that send a banner
-  first; that byte is preserved. If a proxy closes stdout without exiting, the
-  startup timeout also bounds the wait for exit, so later routes are not blocked
-  indefinitely.
-- A native direct TCP candidate also waits for the destination's first byte when
-  the target has more than one candidate route. EOF or timeout before that byte
-  tries the next candidate without forwarding any session data. One timeout
-  budget covers DNS, TCP establishment, and this probe; the byte is replayed.
-  A single native direct route retains general TCP behavior, including
-  client-first protocols and half-close. HTTP/SOCKS5 and command transports
-  retain their existing server-first startup probes even with one route.
-- With `control_master_mkdir = true`, missing ControlPath parent directories
-  are created with mode 0700.
-- Target names accept ordinary DNS/IP/alias characters, not shell expressions,
-  whitespace, or option injection. Put usernames in `user` or OpenSSH's
-  `user@host`, not in host keys.
+- `resolve_command` runs without a shell and must print exactly one hostname/IP.
+  Failed commands, invalid output, and timeouts are errors.
+- `proxy_command` runs locally for direct access or on the SSH gateway when one
+  is used. Install the selected tool where it runs. Ordinary connections do not
+  need `nc` or `socat`.
+- Common tokens are `%h` (hostname), `%n` (requested target), `%p` (port),
+  `%r` (SSH user), and `%g` (gateway). Local tokens include `%u` (user),
+  `%i` (UID), `%d` (home), `%l`/`%L` (full/short hostname), `%C` (connection hash),
+  and `%%` (literal percent). Ordinary SSH options use OpenSSH's token rules.
+- Put usernames in `user` or the command-line `user@host`, not in TOML host keys.
 
-### Gateways and failover
+## Gateways and failover
 
-`gateway_strategy` can be set on hosts, templates, and defaults, with the same
-inheritance, include-merge, and pattern rules as other fields. It is inherited
-independently of `gateways`.
-**The default strategy is `random`**, so list order is not guaranteed.
-Configurations depending on an order, such as direct-first connections, must
-explicitly set `gateway_strategy = "sequential"`.
+Set `gateways` and `gateway_strategy` on hosts, templates, or defaults.
+They are inherited independently. **The default strategy is `random`**;
+use `sequential` explicitly for direct-first or other ordered fallback.
 
 | Strategy           | Meaning of `gateways`                                                  | On failure                               |
 | ------------------ | ---------------------------------------------------------------------- | ---------------------------------------- |
@@ -340,90 +297,57 @@ explicitly set `gateway_strategy = "sequential"`.
 
 ```toml
 [hosts.balanced]
-hostname = "10.0.0.10"
-gateways = ["gateway-a", "gateway-b"]  # Defaults to random.
+hostname = "10.0.0.20"
+gateways = ["bastion", "edge"]
 
 [hosts.fallback]
 hostname = "10.0.0.10"
 gateway_strategy = "sequential"
-gateways = ["direct", "gateway-a", "gateway-b"]
+gateways = ["direct", "bastion"]
 
 [hosts.private]
-hostname = "10.0.0.20"
+hostname = "10.0.0.30"
 gateway_strategy = "chain"
-gateways = ["outer", "inner"]  # Local → outer → inner → private.
+gateways = ["edge", "bastion"]
 ```
 
-An empty list, including `gateways = []`, means no SSH jump hosts for every
-strategy and disables inherited gateways. A separately configured `proxy` still
-applies. `direct` is a direct candidate for random/sequential. Each chain item
-must be a single host name or alias: neither `direct` nor `/` chains are allowed.
-Gateways may have their own strategies and gateways.
-A random/sequential candidate can itself be a complete `inner/outer` chain.
+Here `bastion` and `edge` are the hosts from the [sample configuration](sshweave.toml).
+`gateways = []` removes inherited jump hosts. For `chain`, every item must be a
+single SSH host name or alias; `direct` and `/` chains are not allowed.
+Random/sequential candidates may be `direct`, a host, or a chain such as
+`bastion/edge`. Gateways can have their own gateway settings.
 
-An ad-hoc chain `destination/inner/outer` connects locally to outer, then inner,
-then destination. It overrides both the destination's gateways **and strategy**;
-explicit chain order is never randomized. The `/` syntax is written from the
-destination outwards, the reverse of the traversal order in a chain list.
+For an ad-hoc route, write the destination first, then gateways from inner to outer:
 
-Compilation expands static chains and required suffixes so that each hop uses
-its own authentication settings. The wrapper or automatic updates instantiate
-dynamic glob/regex chains. `config resolve` and `config list --json` expose the
-resolved `gateway_strategy`. The `routes` in `connect --dry-run` show deterministic
-candidate lists or normalized chains such as `inner/outer`, without shuffling,
-commands, or networking. Random ordering happens only at connection time and
-does not trigger configuration rewrites. Graphviz gateway edges show the
-effective strategy; chain edges point to normalized chains.
+```sh
+sshweave wrapper ssh database/bastion/edge
+```
+
+This connects local → edge → bastion → database and overrides the destination's
+configured gateways and strategy. The `/` order is the reverse of a `chain` list.
+Failover only applies during connection establishment; it does not retry SSH
+authentication failures or resume interrupted sessions.
 
 ### Terminal route topology (no connection)
 
 ```sh
 sshweave topology database
-sshweave topology database/inner/outer
+sshweave topology database/bastion/edge
 sshweave topology worker-eu-42 --ascii
-sshweave -c ./sshweave.toml topology database > route.txt
 ```
 
-The `ptree` terminal-tree library renders complete candidate paths from the
-local machine to the target, without Graphviz or a full-screen interface.
-Aliases, glob/regex, inheritance, ad-hoc chains, and nested gateways are supported.
-Each SSH node shows its name and `user@hostname:port`; HTTP/SOCKS5 proxies appear
-before the first hop. For example, `gateways = ["outer", "inner"]` with the chain
-strategy produces:
+The tree shows candidate paths, gateways, proxies, and each host's
+`user@hostname:port`. Random candidates appear in configuration order, not actual
+connection-attempt order. Use `--ascii` for plain branches or `NO_COLOR` to disable color.
 
-```text
-SSH route topology: database [preview only]
-└── Local (this machine)
-    └── Route 1 | database: chain #1 via inner/outer
-        └── outer  [SSH ops@gateway.example.net:22]
-            └── inner  [SSH ops@10.0.0.2:22]
-                └── database  [SSH ops@10.0.0.10:22]
-```
-
-Candidates appear as separate Route branches, not as one chain.
-`sequential` falls back in configuration order; `random` is displayed in fixed
-configuration order for comparison, **not in actual connection-attempt order**.
-`chain` traverses every jump host. Nested candidates expand into complete paths.
-Cycles, excessive depth, or more than 4096 expanded nodes produce explicit
-errors rather than silent truncation.
-
-This command performs static configuration resolution only. It **does not open
-SSH/TCP connections, probe availability, execute hooks, `resolve_command`, or
-`proxy_command`, or write generated configuration, host caches, or control-socket
-directories**. Dynamic nodes are marked as having addresses not yet confirmed by
-their command. Custom transports show only whether their command runs locally or
-on a gateway; their internal network paths cannot be inferred.
-The diagram describes sshweave routes, not IP traceroute, and does not merge
-external hand-written OpenSSH configuration or existing multiplexed sessions.
-Terminal output is automatically colored; redirected output has no ANSI colors.
-`NO_COLOR`, `TERM=dumb`, and `--ascii` are supported.
+This is a configuration preview: it does not connect, test availability, execute
+hooks or commands, or write files. It does not inspect paths inside custom
+commands, external OpenSSH configuration, or existing shared connections.
 
 ### Standalone HTTP / SOCKS5 proxies
 
-Define proxies centrally in top-level `proxies` and reference them by name with
-the host's `proxy` field. **Do not put proxy URLs or `proxy+...` in `gateways`**:
-gateways accept only `direct` and SSH hosts/chains.
-`direct` means no SSH jump host; it does not disable a configured proxy.
+Define proxies in `[proxies.NAME]` and reference the name with `proxy`.
+**Do not put proxy URLs in `gateways`.**
 
 ```toml
 [proxies.local-http]
@@ -434,68 +358,46 @@ url = "socks5://127.0.0.1:7890"
 
 [hosts.proxied]
 hostname = "server.internal"
-proxy = "local-http"  # Local → HTTP CONNECT proxy → server.internal.
+proxy = "local-http"
 
 [hosts.proxied-chain]
 hostname = "database.internal"
 proxy = "local-socks"
 gateway_strategy = "chain"
-gateways = ["outer", "inner"]
-# Local → SOCKS5 proxy → outer → inner → database.internal.
+gateways = ["edge", "bastion"]
 ```
 
-- Unauthenticated HTTP CONNECT and SOCKS5 TCP CONNECT are supported without
-  external nc/curl processes. URLs require an explicit port (1–65535) and support
-  DNS, IPv4, and `[IPv6]`. One trailing `/` is allowed, but paths, queries,
-  fragments, credentials, and other schemes are not. Unsupported authentication
-  produces an explicit error, not a silent fallback.
-- `proxy` supports defaults, templates, includes, aliases, and pattern
-  inheritance like other host fields. Named proxy definitions use root >
-  later include > earlier include precedence. `config check` rejects missing
-  references, invalid URLs, and unknown fields.
-- The target's selected proxy is used only from the local machine to the target
-  or outermost SSH gateway. Nested gateways keep that same selection rather
-  than overriding it with an intermediate gateway's `proxy`; no remote proxy
-  client is required.
-- Proxy failure is explicit; sshweave **never bypasses the proxy with a direct
-  connection**. Gateway strategies can try other candidates, but each keeps the
-  selected proxy. `connect_timeout` covers proxy DNS/TCP establishment, handshake,
-  and the destination's first byte; 0 disables it. HTTP/SOCKS5 handshake bytes
-  never enter the SSH stream.
-- HTTP CONNECT and SOCKS5 delegate destination DNS resolution to the proxy,
-  not the local machine. Targets support ASCII hostnames, IPv4, and IPv6.
-- The same transport segment cannot combine `proxy` and `proxy_command`; this
-  is an explicit configuration error. A remote `proxy_command` executed through
-  an SSH gateway can still be combined with a local first-hop proxy.
-- Proxy definitions are not written as SSH hosts into generated configuration or
-  the host cache. `config json` exports them; `host.options.proxy` in
-  `config resolve` / `connect --dry-run` shows the reference name. Graphviz
-  displays proxies as separate nodes.
-- Internal gateway SSH connections disable multiplexing when a proxy is in use,
-  avoiding reuse of old direct gateway connections. Existing outer OpenSSH
-  target sessions still follow their multiplexing settings; close their control
-  connections after switching proxies if you need a new end-to-end route.
+- Only unauthenticated `http://` and `socks5://` proxies are supported. Include
+  an explicit port (1–65535); use brackets around IPv6 addresses. URLs cannot
+  contain credentials, queries, fragments, or paths other than a trailing `/`.
+- `proxy` supports the same defaults, templates, and inheritance as other host
+  settings. Missing proxy references and invalid URLs fail `config check`.
+- The destination's proxy is used from the local machine to the target or
+  outermost SSH gateway, including nested routes. Destination DNS is resolved
+  by the proxy; no proxy client is needed on the gateway.
+- `direct` and `gateways = []` remove SSH jumps, not the selected proxy.
+  Proxy failures **never cause a silent direct connection**.
+- Do not combine `proxy` and `proxy_command` on the same transport segment.
+  A local proxy can still be combined with a command running on an SSH gateway.
+- After changing proxies, close existing [shared connections](#connection-sharing)
+  if you need subsequent sessions to use the new route.
 
-### Transport failure and rate limiting
+### Timeouts and rate limits
 
-Route failover happens only during connection establishment, before the
-destination's first byte. Once session forwarding starts, errors are returned
-without reconnecting and mixing in another SSH byte stream.
-Static gateway cycles are rejected at load time; dynamic chains also have
-cross-process visit-stack and depth protection.
+`connect_timeout` is in seconds, defaults to 10, and is disabled with 0. It covers
+connection setup, including DNS, `resolve_command`, and proxy startup.
 
-`rate_limit = "5 MiB/s"` caps the **combined send and receive traffic** for one
-proxy connection, not 5 MiB in each direction. B/KB/MB/GB and KiB/MiB/GiB are
-supported, with an optional `/s`. This is not a global quota across processes or
-sessions; a defaults value is applied separately to each session.
+`rate_limit = "5 MiB/s"` limits the **combined send and receive traffic** of each
+connection. B/KB/MB/GB and KiB/MiB/GiB are supported, with optional `/s`.
+A value in defaults applies separately to each connection, not as a global quota.
 
 ## Hooks
 
 Six events are available: `before_connect`, `on_connect`, `on_connect_error`,
 `on_disconnect`, `before_config_write`, and `after_config_write`.
-The first four belong to hosts/templates/defaults. Configuration-write events
-use the resolved, inherited defaults. Hooks within an event run in order;
-failures are reported, not silently ignored.
+Put connection events in hosts/templates/defaults and configuration-write events
+in defaults. Write events run only when generated content changes. Hooks within
+an event run in order; failures are reported.
 
 ```toml
 [defaults.hooks]
@@ -515,22 +417,22 @@ on_disconnect = [
 ]
 ```
 
-| Driver | Field   | Behavior                                                          |
-| ------ | ------- | ----------------------------------------------------------------- |
-| write  | message | Write to stderr without contaminating SSH stdout                  |
-| exec   | command | Run `/bin/sh -c`, wait, and report nonzero exit                   |
-| daemon | command | Run in a background process group; log failures to stderr         |
-| notify | message | Send a desktop notification with system commands; report failures |
+| Driver | Field   | Behavior                                    |
+| ------ | ------- | ------------------------------------------- |
+| write  | message | Print a message to stderr                   |
+| exec   | command | Run a shell command and wait for completion |
+| daemon | command | Run a command in the background             |
+| notify | message | Send a desktop notification                 |
 
-Templates use MiniJinja, not Go templates. Undefined variables are errors.
-Connection context contains `host` (name/hostname/user/port/options, etc.),
-`gateway` (connection-attempt events), `stats` (connect/disconnect events), or
-`error` (failure/disconnect events).
-Stats include connected_at/disconnected_at (Unix seconds), sent_bytes,
-received_bytes, duration_seconds, and average_bytes_per_second.
-`on_connect` means the TCP/proxy transport is established, not that SSH
-authentication has completed. `on_disconnect` follows the proxy stream's
-lifetime, not an individual multiplexed session.
+Templates use Jinja-style syntax; undefined variables are errors. Available
+values depend on the event: `host`, `gateway`, `stats`, and `error`.
+Stats include `sent_bytes`, `received_bytes`, `duration_seconds`,
+`average_bytes_per_second`, and `connected_at`/`disconnected_at` (Unix seconds).
+Desktop notifications require `osascript` on macOS or `notify-send` on Linux.
+
+`on_connect` means transport establishment, not successful SSH authentication.
+`on_disconnect` runs when the transport closes, not when each multiplexed SSH
+session ends.
 
 exec/daemon also receive the JSON environment variable `SSHWEAVE_CONTEXT`.
 When inserting text into shell templates, use `{{ host.name | shellquote }}` or
@@ -539,221 +441,85 @@ Configuration is **trusted executable input**; do not load untrusted TOML/hooks.
 
 ## Commands
 
-```sh
-sshweave -c ./sshweave.toml config check
-sshweave config build                         # OpenSSH configuration to stdout
-sshweave config build --write                 # Atomically update settings.output
-sshweave config build --no-automatic-rewrite
-sshweave config json                          # Merged configuration
-sshweave config json --expand                 # Resolved concrete hosts
-sshweave config list
-sshweave config list --json
-sshweave config search production
-sshweave config resolve database/bastion
-sshweave config graphviz | dot -Tsvg > hosts.svg
-sshweave connect --dry-run database            # Routes only; no connections, hooks, or commands
-sshweave topology database                    # Terminal diagram; no connection
-sshweave ping --count 4 --interval 0.5 database # TCP latency/success; no gateways or proxies
-sshweave sockets list
-sshweave sockets master database
-sshweave sockets flush                        # ssh -O exit, not just socket-file removal
-sshweave cache list --json                    # Materialized names, not SSH host keys
-sshweave cache remove worker-eu-42 --dry-run
-sshweave cache remove worker-eu-42
-sshweave cache clear --dry-run
-sshweave info
-sshweave completions zsh
-```
+| Task                                             | Command                                           |
+| ------------------------------------------------ | ------------------------------------------------- |
+| Validate a chosen configuration                  | `sshweave -c ./sshweave.toml config check`        |
+| Print generated OpenSSH configuration            | `sshweave config build`                           |
+| Update the managed configuration file            | `sshweave config build --write`                   |
+| Generate configuration without automatic updates | `sshweave config build --no-automatic-rewrite`    |
+| List hosts, aliases, and patterns                | `sshweave config list`                            |
+| List resolved hosts as JSON                      | `sshweave config list --json`                     |
+| Search hosts                                     | `sshweave config search production`               |
+| Inspect a host or chain                          | `sshweave config resolve database/bastion`        |
+| Export merged configuration                      | `sshweave config json`                            |
+| Export resolved concrete hosts                   | `sshweave config json --expand`                   |
+| Preview routes as JSON, without connecting       | `sshweave connect --dry-run database`             |
+| Export relationships as Graphviz DOT             | `sshweave config graphviz`                        |
+| Probe direct TCP latency, not ICMP               | `sshweave ping --count 4 --interval 0.5 database` |
+| Show version, paths, and loaded files            | `sshweave info`                                   |
+| Generate shell completions                       | `sshweave completions zsh`                        |
 
 Global options: `--config`/`-c`, `--verbose`/`-v`, and `--debug`.
 `SSHWEAVE_CONFIG`, `SSHWEAVE_DEBUG`, and standard `RUST_LOG` are supported.
-Arguments such as `-v` after the wrapped program name (ssh/scp/sftp/rsync)
-are passed to that program; put sshweave global options before `wrapper`.
+Use `sshweave <command> --help` for available options, except wrapper help,
+which uses `sshweave help wrapper`.
 
-The wrapper manages `-F`, SSH routing, and rsync's remote shell. Conflicting
-configuration files, SSH/SCP/SFTP `-J`, routing overrides through `-o`, and rsync
-`-e` are rejected before registry/configuration writes. Attached values such as
-`-Jjump` and grouped short options such as `-vJjump` are checked too.
-Use `gateways` or an explicit `target/gateway` chain instead of `-J`.
-Valid rsync `-F` is passed through normally; remote SSH command arguments remain
-untouched.
-For more complex OpenSSH/rsync invocations, use the generated file with native
-commands.
+`ping` uses direct TCP, **not configured gateways or proxies**. It defaults to
+4 probes; `--count 0` runs until Ctrl+C. No successful probes means a failure exit
+status. SVG export with `sshweave config graphviz | dot -Tsvg > hosts.svg`
+requires the optional Graphviz `dot` command.
 
-ping defaults to 4 probes; `--count 0` runs continuously. Ctrl+C prints statistics
-for completed probes. With no successful probes, it returns failure.
-sockets lists only actual Unix sockets, ignoring ordinary files in the same
-directory. Literal `*`, `?`, and `[]` in ControlPath are not expanded as globs;
-only dynamic host tokens are used for matching.
+### Connection sharing
+
+To reuse connections and manage them with `sockets`, configure `ControlPath`:
+
+```toml
+[defaults]
+control_master_mkdir = true
+
+[defaults.ssh]
+ControlMaster = "auto"
+ControlPersist = "5m"
+ControlPath = "~/.config/sshweave/control/%C"
+```
+
+`control_master_mkdir` creates missing control-socket directories when needed.
+The [sample configuration](sshweave.toml) already enables this setup.
+
+```sh
+sshweave sockets list
+sshweave sockets master database
+sshweave sockets flush
+```
+
+`master` opens background SSH connections and may require authentication.
+`flush` closes managed control connections and can interrupt sessions using
+them. Existing shared connections may keep an old route after configuration
+changes; close them when ready to reconnect.
 
 ### Managing materialized targets
 
-The generated configuration has a 4096-target expansion limit, counting distinct
-configured names, literal aliases, registered targets, gateways, and chain
-components together. This is not a limit on the number of pattern rules.
-Registration validates the complete expanded set while holding the registry lock.
-An overflowing update reports an error and does not change the existing registry.
+Names used for dynamic hosts and chains are remembered in `settings.known_hosts`.
+This is a target cache, **not OpenSSH's host-key database**.
+Use names from `cache list` in place of `old-worker` below:
 
 ```sh
 sshweave cache list
-sshweave cache list --json
-sshweave cache remove old-worker old-worker/gateway --dry-run
-sshweave cache remove old-worker old-worker/gateway
-sshweave config build --write
-# To recover by clearing all dynamically registered names:
-sshweave cache clear --dry-run
-sshweave cache clear
+sshweave cache remove old-worker --dry-run
+sshweave cache remove old-worker
 sshweave config build --write
 ```
 
-Removal uses exact names, not patterns; unknown names are errors and do not
-partially apply. Commands print selected names to stdout and a summary to stderr.
-`--dry-run` creates no files or directories and does not acquire file locks or run
-hooks. Removal changes only `settings.known_hosts`; use an explicit build or the
-next wrapper invocation to update the generated configuration. Configured hosts
-and gateways still required by other routes remain in generated output.
-Connecting to a removed name may register it again.
+Removal uses exact names, not patterns; unknown names are errors.
+`--dry-run` previews changes without writing files or running hooks.
+To clear all cached names, preview with `sshweave cache clear --dry-run`, then
+use `sshweave cache clear` and rebuild. Add `--json` to `cache list` for scripts.
 
-These commands never edit OpenSSH host keys, source TOML, private keys, or control
-sockets. There is no automatic eviction of existing names.
+Removal updates only the cache. Rebuild or use a wrapper to refresh generated
+configuration; configured hosts and gateways still needed by other routes remain.
+Reconnecting can add a removed name again. No names are evicted automatically.
+OpenSSH host keys, source TOML, private keys, and control sockets are not changed.
 
-## Architecture and maintenance
-
-```text
-lib.rs       Crate overview and module wiring (see `cargo doc --open`)
-main.rs      clap CLI, application use cases, subprocess exit codes
-wrapper.rs   Binary-only SSH-compatible argument handling and process invocation
-config.rs    TOML model, include loading, validation, inheritance
-resolver.rs  Borrowed compiled resolver, alias index, captures, gateway validation, tokens
-render.rs    Deterministic OpenSSH / Graphviz compilation
-topology.rs  Read-only route topology, full candidate expansion, terminal trees
-store.rs     Host registry, file locks, 0600 temporary files, fsync + atomic replacement
-runtime.rs   TCP/proxy transport, startup detection, bidirectional relay, limits, stats
-proxy.rs     Proxy URL validation, unauthenticated HTTP CONNECT / SOCKS5 handshakes
-hooks.rs     Templates, events, drivers (always isolated from protocol stdout)
-sockets.rs   Control-socket discovery and lifecycle
-util.rs      Strict environment/path expansion, input and unit validation, private directories
-tests/       Integration tests; tests/common isolates HOME from the developer's conf.d
-```
-
-Generated configuration emits concrete hosts first and excludes instantiated
-hosts from wildcard rules, avoiding duplicate accumulated IdentityFile or
-LocalForward options in OpenSSH. The registry is not OpenSSH's `known_hosts`
-host-key database: it stores instantiated names, not private keys or credentials.
-Existing user SSH files are not deleted or cleaned up.
-
-Run these checks from the repository root:
-
-```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --all-targets --locked
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
-cargo test --doc --locked
-python3 -m unittest discover -s scripts -p 'test_*.py'
-python3 scripts/check_docs.py
-go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/ci.yml .github/workflows/release.yml
-```
-
-Python 3.11+ is used only for development/release tooling; workflow linting uses Go.
-Neither is an application runtime dependency.
-
-Lint policy lives in `Cargo.toml` (`[lints]`): public items must be documented,
-and `unsafe` code is forbidden in the library and binary.
-
-Tests cover merging, precedence, patterns, cycles, invalid input, file protection,
-atomic updates, concurrent rebuilds, hook errors, byte-level transport,
-half-closes, early remote disconnects, shared rate-limit thresholds,
-random/sequential gateway failover, chain expansion and overrides, wrapper
-arguments/exit codes, and real `ssh -G` and generated ProxyCommand execution.
-Proxy tests cover HTTP/SOCKS5 handshakes, remote DNS, IPv4/IPv6, binary streams and
-half-closes, malformed/rejected responses, timeouts, no direct proxy bypass,
-and combinations of proxies with multiple SSH jump hosts.
-Integration tests use local TCP and controlled proxy processes, not external
-SSH servers or login credentials.
-CI runs these checks on Linux/macOS with stable Rust and the minimum supported
-Rust 1.88. It also checks local Markdown file links, release tooling, workflow
-syntax, and the resolver performance budget. Actions are pinned to commit hashes
-and updated by Dependabot; Cargo caches avoid rebuilding unchanged dependencies.
-Redundant branch/PR runs are cancelled without cancelling tag releases.
-External gateway authentication, real multihop SSH sessions, and
-desktop notifications still require validation in the deployment environment.
-
-### Resolver performance
-
-`Config::resolver()` borrows the configuration and compiles regex/glob rules,
-indexes literal aliases, and reuses inherited options for a batch of lookups.
-Rendering, topology, listing, and route expansion use the same compiled view.
-The existing `Config::resolve()` API remains available. Configuration fields
-remain editable between views; create a new resolver after editing. There is
-no persistent cache, so include/environment changes cannot be hidden by stale
-cross-process state.
-
-Inheritance and gateway memoization retain cycle checks and total depth limits,
-including when a cached subtree is reached through a longer prefix. Matching
-precedence, declaration order, and deterministic rendering are unchanged.
-
-```sh
-cargo build --release --locked
-python3 scripts/benchmark.py
-python3 scripts/benchmark.py --iterations 5 --max-regex-ms 250
-```
-
-The benchmark uses temporary configurations and HOME, one warmup, and repeated
-CLI `config check` invocations. JSON reports all samples and medians for literal
-hosts and regex rules. CI enforces a 250 ms median budget for 180 regex rules
-on its Linux runner and retains the report. Local measurements depend on the
-machine and include process startup; they are not a production SLA.
-
-### Releases
-
-[The release workflow](../.github/workflows/release.yml) builds native binaries
-for all four targets above. A manual `workflow_dispatch` run performs validation
-and packaging, including the combined `verified-release` artifact and
-`SHA256SUMS`, but **does not publish**. Pushing a `vVERSION` tag validates that
-it exactly matches `Cargo.toml`, runs the reusable CI checks and each platform's
-tests, then packages binaries, documentation, and completions.
-
-Before publishing, all four archives and individual SHA-256 files must be present
-and pass checksum verification. The workflow creates `SHA256SUMS`, then creates a
-GitHub Release with generated notes. Pre-release versions are marked accordingly.
-Only the publishing job has `contents: write`; existing releases are not
-overwritten. No crates.io publishing, Apple signing, or notarization is performed.
-
-For a local packaging check, replace `TARGET` with the native Rust target:
-
-```sh
-cargo build --release --locked --target TARGET
-python3 scripts/release.py metadata
-python3 scripts/release.py package --target TARGET --binary target/TARGET/release/sshweave --output target/release-check
-```
-
-Archives use normalized ownership, permissions, and timestamps; CI supplies the
-commit timestamp, and local packaging defaults to epoch zero. These metadata
-choices make packaging reproducible for identical inputs, not the compiler
-output itself. The scripts never upload anything.
-
-Maintainers should update the version and lockfile, complete a manual release
-rehearsal, then create and push the matching tag. This does not happen as part of
-ordinary builds, tests, or packaging.
-Merge the workflow onto the repository's default branch before starting a manual
-run from the Actions page.
-
-### Commits and pushes
-
-The repository is `git@github.com:mingcheng/sshweave.git`, with `main` as its
-default branch. Before committing, run the checks above and inspect staged
-changes with `git status --short` and `git diff --cached --check`.
-Commit `Cargo.lock` alongside application source so local builds and CI use the
-same dependency versions.
-
-The repository uses UTF-8 and LF; use `cargo fmt` for Rust formatting.
-Build directories (including symlinks), local editor settings, environment files,
-and common private-key files are ignored. Ignore rules do not replace manual
-review: never commit real SSH configuration, host inventories, or credentials.
-For a first push, use `git push -u origin main` after creating a local commit,
-confirming that the remote repository exists, and configuring GitHub SSH
-authentication.
-
-Released under the MIT license. The design is inspired by assh, with its
-copyright attribution retained; see [LICENSE](../LICENSE).
+Generated configuration supports up to 4096 distinct targets, including configured
+names, aliases, cached targets, and gateway-chain components. Remove unused cached
+names if they cause this limit to be reached.
