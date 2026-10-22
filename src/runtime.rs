@@ -1,7 +1,14 @@
+//! Connection runtime used by `sshweave connect` (OpenSSH's ProxyCommand).
+//!
+//! For each candidate route sshweave opens a byte stream — direct TCP, an
+//! HTTP/SOCKS5 proxy, a local `proxy_command`, or `ssh -W` through a gateway —
+//! waits for the destination to send its first byte, and then relays
+//! stdin/stdout until both directions close.
+
 use crate::{
     config::{Config, Event, GatewayStrategy},
     hooks, proxy,
-    resolver::ResolvedHost,
+    resolver::{MAX_GATEWAY_DEPTH, ResolvedHost},
     util,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -25,22 +32,61 @@ use tokio::{
     time::{Instant, sleep_until, timeout},
 };
 
+/// Timeout in seconds used when `connect_timeout` is not configured.
+const DEFAULT_CONNECT_TIMEOUT: u64 = 10;
+
+/// Relay buffer size without a rate limit.
+const BUFFER_SIZE: usize = 16 * 1024;
+
+/// Environment variable carrying the JSON list of targets on the current route,
+/// used to detect gateway cycles across nested sshweave processes.
+const ROUTE_STACK_ENV: &str = "SSHWEAVE_ROUTE_STACK";
+
+/// Environment variable forcing the proxy of the outermost hop in nested processes.
+const ROUTE_PROXY_ENV: &str = "SSHWEAVE_ROUTE_PROXY";
+
 type Reader = Pin<Box<dyn AsyncRead + Send>>;
 type Writer = Pin<Box<dyn AsyncWrite + Send>>;
 
+/// An established transport to the destination.
 struct Connection {
     reader: Reader,
     writer: Option<Writer>,
+    /// Transport process to reap when the relay ends, if any.
     child: Option<Child>,
 }
 
+impl Connection {
+    /// Wraps a stream, replaying `first` (the startup probe byte) before `reader`.
+    fn new(
+        first: Option<u8>,
+        reader: impl AsyncRead + Send + 'static,
+        writer: impl AsyncWrite + Send + 'static,
+        child: Option<Child>,
+    ) -> Self {
+        let prefix = std::io::Cursor::new(first.map(|byte| vec![byte]).unwrap_or_default());
+        Self {
+            reader: Box::pin(prefix.chain(reader)),
+            writer: Some(Box::pin(writer)),
+            child,
+        }
+    }
+}
+
+/// Transfer statistics exposed to `on_connect` and `on_disconnect` hooks.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Stats {
+    /// Unix timestamp (seconds) when the relay started.
     pub connected_at: u64,
+    /// Unix timestamp (seconds) when the relay ended.
     pub disconnected_at: u64,
+    /// Bytes sent from local stdin to the destination.
     pub sent_bytes: u64,
+    /// Bytes received from the destination.
     pub received_bytes: u64,
+    /// Relay duration in seconds.
     pub duration_seconds: f64,
+    /// Combined throughput over the relay duration.
     pub average_bytes_per_second: f64,
 }
 
@@ -48,12 +94,29 @@ fn now() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
 
+/// Awaits `future`, failing with `message` after `seconds`; `0` disables the timeout.
+async fn with_timeout<T>(
+    seconds: u64,
+    message: &'static str,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    if seconds == 0 {
+        future.await
+    } else {
+        timeout(Duration::from_secs(seconds), future)
+            .await
+            .context(message)?
+    }
+}
+
+/// A token-bucket style limiter shared by both relay directions.
 pub struct RateLimiter {
     bytes_per_second: u64,
     next: Mutex<Instant>,
 }
 
 impl RateLimiter {
+    /// Creates a limiter allowing `bytes_per_second` (must be positive).
     pub fn new(bytes_per_second: u64) -> Result<Self> {
         ensure!(bytes_per_second > 0, "rate must be positive");
         Ok(Self {
@@ -62,6 +125,8 @@ impl RateLimiter {
         })
     }
 
+    /// Reserves `bytes` of budget and sleeps until it is available.
+    #[allow(clippy::cast_precision_loss)]
     pub async fn acquire(&self, bytes: usize) {
         let deadline = {
             let mut next = self.next.lock().await;
@@ -71,8 +136,17 @@ impl RateLimiter {
         };
         sleep_until(deadline).await;
     }
+
+    /// Chunk size giving roughly ten writes per second, capped at [`BUFFER_SIZE`].
+    fn chunk_size(&self) -> usize {
+        usize::try_from(self.bytes_per_second / 10)
+            .unwrap_or(BUFFER_SIZE)
+            .clamp(1, BUFFER_SIZE)
+    }
 }
 
+/// Copies `reader` to `writer` until EOF, then shuts down `writer`.
+/// Returns the number of bytes copied.
 pub async fn copy_limited<R, W>(
     mut reader: R,
     mut writer: W,
@@ -85,6 +159,8 @@ where
     copy_counted(&mut reader, &mut writer, limiter, &AtomicU64::new(0)).await
 }
 
+/// Like [`copy_limited`], also publishing progress through `counter` so partial
+/// counts survive cancellation.
 async fn copy_counted<R, W>(
     mut reader: R,
     mut writer: W,
@@ -95,9 +171,9 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let buffer_size = limiter.as_ref().map_or(16 * 1024, |limit| {
-        (limit.bytes_per_second / 10).clamp(1, 16 * 1024) as usize
-    });
+    let buffer_size = limiter
+        .as_deref()
+        .map_or(BUFFER_SIZE, RateLimiter::chunk_size);
     let mut buffer = vec![0; buffer_size];
     let mut count = 0;
     loop {
@@ -116,39 +192,39 @@ where
     }
 }
 
+/// Opens a TCP connection with `TCP_NODELAY`; `seconds == 0` disables the timeout.
 pub async fn dial(hostname: &str, port: u16, seconds: u64) -> Result<TcpStream> {
-    let connect = TcpStream::connect((hostname, port));
-    let stream = if seconds == 0 {
-        connect.await?
-    } else {
-        timeout(Duration::from_secs(seconds), connect)
-            .await
-            .context("TCP connection timeout")??
-    };
+    let stream = with_timeout(seconds, "TCP connection timeout", async {
+        Ok(TcpStream::connect((hostname, port)).await?)
+    })
+    .await?;
     stream.set_nodelay(true)?;
     Ok(stream)
 }
 
+/// Runs per-attempt preparation: `resolve_command` (which may replace the
+/// hostname) and ControlPath directory creation.
 pub async fn prepare(host: &mut ResolvedHost, gateway: &str) -> Result<()> {
     if let Some(args) = &host.options.resolve_command {
         let args = args
             .iter()
             .map(|arg| host.expand(arg, gateway))
             .collect::<Result<Vec<_>>>()?;
-        let mut command = Command::new(&args[0]);
+        let (program, args) = args.split_first().context("resolve_command is empty")?;
+        let mut command = Command::new(program);
         command
-            .args(&args[1..])
+            .args(args)
             .stdin(Stdio::null())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
-        let seconds = host.options.connect_timeout.unwrap_or(10);
-        let output = if seconds == 0 {
-            command.output().await?
-        } else {
-            timeout(Duration::from_secs(seconds), command.output())
-                .await
-                .context("resolve_command timeout")??
-        };
+        let seconds = host
+            .options
+            .connect_timeout
+            .unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+        let output = with_timeout(seconds, "resolve_command timeout", async {
+            Ok(command.output().await?)
+        })
+        .await?;
         ensure!(
             output.status.success(),
             "resolve_command exited with {}",
@@ -169,27 +245,21 @@ pub async fn prepare(host: &mut ResolvedHost, gateway: &str) -> Result<()> {
     prepare_control_path(host)
 }
 
+/// Creates the ControlPath parent directory when `control_master_mkdir` is set.
 pub fn prepare_control_path(host: &ResolvedHost) -> Result<()> {
     if host.options.control_master_mkdir == Some(true)
         && let Some(value) = host.options.control_path()?
     {
         let expanded = host.expand(&value, "")?;
-        let path = std::path::Path::new(&expanded);
-        let parent = path.parent().context("ControlPath has no parent")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)?;
-            #[cfg(not(unix))]
-            std::fs::create_dir_all(parent)?;
-        }
+        let parent = std::path::Path::new(&expanded)
+            .parent()
+            .context("ControlPath has no parent")?;
+        util::create_private_dir(parent)?;
     }
     Ok(())
 }
 
+/// Spawns a transport process and waits until the destination sends data.
 async fn child_connection(mut command: Command, seconds: u64) -> Result<Connection> {
     command
         .stdin(Stdio::piped())
@@ -202,7 +272,7 @@ async fn child_connection(mut command: Command, seconds: u64) -> Result<Connecti
     // A spawned ssh process is not a successful route until the destination speaks.
     // Retain this byte so startup detection never consumes protocol data.
     let mut first = [0u8; 1];
-    let startup = async {
+    with_timeout(seconds, "proxy startup timeout", async {
         let size = reader
             .read(&mut first)
             .await
@@ -211,22 +281,47 @@ async fn child_connection(mut command: Command, seconds: u64) -> Result<Connecti
             let status = child.wait().await?;
             bail!("proxy exited before receiving destination data: {status}");
         }
-        Ok::<_, anyhow::Error>(())
-    };
-    if seconds == 0 {
-        startup.await?;
-    } else {
-        timeout(Duration::from_secs(seconds), startup)
-            .await
-            .context("proxy startup timeout")??;
-    }
-    Ok(Connection {
-        reader: Box::pin(std::io::Cursor::new(first.to_vec()).chain(reader)),
-        writer: Some(Box::pin(writer)),
-        child: Some(child),
+        Ok(())
     })
+    .await?;
+    Ok(Connection::new(Some(first[0]), reader, writer, Some(child)))
 }
 
+/// Connects through a named HTTP/SOCKS5 proxy and waits for destination data.
+async fn proxy_connection(
+    config: &Config,
+    host: &ResolvedHost,
+    proxy_name: &str,
+    seconds: u64,
+) -> Result<Connection> {
+    ensure!(
+        host.options.proxy_command.is_none(),
+        "proxy and proxy_command cannot be combined on the same transport"
+    );
+    let definition = config
+        .document
+        .proxies
+        .get(proxy_name)
+        .with_context(|| format!("unknown proxy {proxy_name:?}"))?;
+    let proxy = proxy::Endpoint::parse(&definition.url)?;
+    with_timeout(seconds, "proxy startup timeout", async {
+        let mut stream = dial(&proxy.host, proxy.port, 0)
+            .await
+            .with_context(|| format!("connect proxy {proxy_name:?}"))?;
+        proxy
+            .negotiate(&mut stream, &host.hostname, host.port)
+            .await?;
+        let first = stream
+            .read_u8()
+            .await
+            .context("read destination data after proxy handshake")?;
+        let (reader, writer) = stream.into_split();
+        Ok(Connection::new(Some(first), reader, writer, None))
+    })
+    .await
+}
+
+/// Opens one route attempt to `host` via `gateway` (`direct` or a target).
 async fn open(
     config: &Config,
     host: &ResolvedHost,
@@ -234,47 +329,16 @@ async fn open(
     stack: &[String],
     proxy_name: Option<&str>,
 ) -> Result<Connection> {
-    let seconds = host.options.connect_timeout.unwrap_or(10);
+    let seconds = host
+        .options
+        .connect_timeout
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT);
     if gateway == "direct"
         && let Some(proxy_name) = proxy_name
     {
-        ensure!(
-            host.options.proxy_command.is_none(),
-            "proxy and proxy_command cannot be combined on the same transport"
-        );
-        let definition = config
-            .document
-            .proxies
-            .get(proxy_name)
-            .with_context(|| format!("unknown proxy {proxy_name:?}"))?;
-        let proxy = proxy::Endpoint::parse(&definition.url)?;
-        let startup = async {
-            let mut stream = dial(&proxy.host, proxy.port, 0)
-                .await
-                .with_context(|| format!("connect proxy {proxy_name:?}"))?;
-            proxy
-                .negotiate(&mut stream, &host.hostname, host.port)
-                .await?;
-            let first = stream
-                .read_u8()
-                .await
-                .context("read destination data after proxy handshake")?;
-            let (reader, writer) = stream.into_split();
-            Ok::<_, anyhow::Error>(Connection {
-                reader: Box::pin(std::io::Cursor::new(vec![first]).chain(reader)),
-                writer: Some(Box::pin(writer)),
-                child: None,
-            })
-        };
-        return if seconds == 0 {
-            startup.await
-        } else {
-            timeout(Duration::from_secs(seconds), startup)
-                .await
-                .context("proxy startup timeout")?
-        };
+        return proxy_connection(config, host, proxy_name, seconds).await;
     }
-    let args = host
+    let proxy_command = host
         .options
         .proxy_command
         .as_ref()
@@ -285,21 +349,20 @@ async fn open(
         })
         .transpose()?;
     if gateway == "direct" {
-        if let Some(args) = args {
-            let mut command = Command::new(&args[0]);
-            command.args(&args[1..]);
+        if let Some(args) = proxy_command {
+            let (program, args) = args.split_first().context("proxy_command is empty")?;
+            let mut command = Command::new(program);
+            command.args(args);
             return child_connection(command, seconds).await;
         }
         let stream = dial(&host.hostname, host.port, seconds)
             .await
             .with_context(|| format!("connect {}:{}", host.hostname, host.port))?;
         let (reader, writer) = stream.into_split();
-        return Ok(Connection {
-            reader: Box::pin(reader),
-            writer: Some(Box::pin(writer)),
-            child: None,
-        });
+        return Ok(Connection::new(None, reader, writer, None));
     }
+    // Gateway hop: let OpenSSH reach the gateway (itself routed by sshweave),
+    // then forward to the destination or run proxy_command there.
     util::valid_target(gateway)?;
     let mut command = Command::new(config.ssh_binary()?);
     command
@@ -308,34 +371,36 @@ async fn open(
         .arg("-o")
         .arg(format!("ConnectTimeout={seconds}"))
         .arg("-o")
-        .arg("ExitOnForwardFailure=yes");
+        .arg("ExitOnForwardFailure=yes")
+        .env(ROUTE_STACK_ENV, serde_json::to_string(stack)?);
     if let Some(proxy_name) = proxy_name {
-        command.env("SSHWEAVE_ROUTE_PROXY", proxy_name);
-        command
-            .arg("-o")
-            .arg("ControlMaster=no")
-            .arg("-o")
-            .arg("ControlPath=none");
+        // A shared control master could bypass the proxy, so disable multiplexing.
+        command.env(ROUTE_PROXY_ENV, proxy_name).args([
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+        ]);
     }
-    if let Some(args) = args {
+    if let Some(args) = proxy_command {
         command.arg("--").arg(gateway).arg(shell_words::join(args));
     } else {
-        let address = if host.hostname.contains(':') {
-            format!("[{}]:{}", host.hostname, host.port)
-        } else {
-            format!("{}:{}", host.hostname, host.port)
-        };
-        command.arg("-W").arg(address).arg("--").arg(gateway);
+        command
+            .arg("-W")
+            .arg(util::authority(&host.hostname, host.port))
+            .arg("--")
+            .arg(gateway);
     }
-    command.env("SSHWEAVE_ROUTE_STACK", serde_json::to_string(stack)?);
     child_connection(command, seconds).await
 }
 
+/// Relays stdin/stdout over `connection` until both directions finish, running
+/// `on_connect`/`on_disconnect` hooks around the transfer.
 async fn relay(connection: &mut Connection, host: &ResolvedHost) -> Result<Stats> {
     let limiter = host
         .options
         .rate_limit
-        .as_ref()
+        .as_deref()
         .map(|rate| RateLimiter::new(util::rate_bytes(rate)?).map(Arc::new))
         .transpose()?;
     let start = Instant::now();
@@ -346,7 +411,7 @@ async fn relay(connection: &mut Connection, host: &ResolvedHost) -> Result<Stats
     hooks::invoke(
         &host.options,
         Event::OnConnect,
-        &json!({"host":host, "stats":stats}),
+        &json!({"host": host, "stats": stats}),
     )
     .await?;
     let sent = AtomicU64::new(0);
@@ -364,11 +429,13 @@ async fn relay(connection: &mut Connection, host: &ResolvedHost) -> Result<Stats
             &received,
         );
         tokio::pin!(upload, download);
+        // The session ends when the destination closes. If local stdin closes
+        // first (a half-close), keep draining the destination until it does.
         tokio::select! {
-            result = &mut download => { stats.received_bytes = result?; }
+            result = &mut download => { result?; }
             result = &mut upload => {
-                stats.sent_bytes = result?;
-                stats.received_bytes = download.await?;
+                result?;
+                download.await?;
             }
         }
         Ok::<_, anyhow::Error>(())
@@ -379,9 +446,7 @@ async fn relay(connection: &mut Connection, host: &ResolvedHost) -> Result<Stats
             // Closing the read side or stdin may leave ssh alive; reap it explicitly.
             match child.try_wait()? {
                 Some(status) => ensure!(status.success(), "proxy transport exited with {status}"),
-                None => {
-                    child.kill().await?;
-                }
+                None => child.kill().await?,
             }
         }
         Ok::<_, anyhow::Error>(())
@@ -391,10 +456,16 @@ async fn relay(connection: &mut Connection, host: &ResolvedHost) -> Result<Stats
     stats.received_bytes = received.load(Ordering::Relaxed);
     stats.disconnected_at = now()?;
     stats.duration_seconds = start.elapsed().as_secs_f64();
-    stats.average_bytes_per_second =
-        (stats.sent_bytes + stats.received_bytes) as f64 / stats.duration_seconds.max(f64::EPSILON);
-    let hook = hooks::invoke(&host.options, Event::OnDisconnect,
-        &json!({"host":host, "stats":stats, "error":transfer.as_ref().err().map(ToString::to_string)}))        .await;
+    #[allow(clippy::cast_precision_loss)]
+    let total_bytes = (stats.sent_bytes + stats.received_bytes) as f64;
+    stats.average_bytes_per_second = total_bytes / stats.duration_seconds.max(f64::EPSILON);
+    let error = transfer.as_ref().err().map(ToString::to_string);
+    let hook = hooks::invoke(
+        &host.options,
+        Event::OnDisconnect,
+        &json!({"host": host, "stats": stats, "error": error}),
+    )
+    .await;
     if let Err(error) = &hook {
         tracing::error!(error = %format!("{error:#}"), "disconnect hook failed");
     }
@@ -404,6 +475,7 @@ async fn relay(connection: &mut Connection, host: &ResolvedHost) -> Result<Stats
     Ok(stats)
 }
 
+/// Returns the routes to attempt, shuffled for the random strategy.
 fn attempt_routes(host: &ResolvedHost, rng: &mut impl Rng) -> Vec<String> {
     let mut routes = host.routes();
     if host.gateway_strategy == GatewayStrategy::Random {
@@ -412,6 +484,19 @@ fn attempt_routes(host: &ResolvedHost, rng: &mut impl Rng) -> Vec<String> {
     routes
 }
 
+/// Reads an optional environment variable, rejecting non-Unicode values.
+fn optional_env(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {name}")),
+    }
+}
+
+/// Connects to `target`, trying each route until one succeeds, and relays
+/// stdin/stdout until the session ends.
+///
+/// `port` and `user` override resolved values (OpenSSH passes `%p`/`%r`).
 pub async fn connect(
     config: &Config,
     target: &str,
@@ -426,39 +511,36 @@ pub async fn connect(
     if let Some(user) = user {
         host.user = user.into();
     }
-    let mut stack: Vec<String> = match std::env::var("SSHWEAVE_ROUTE_STACK") {
-        Ok(value) => serde_json::from_str(&value).context("invalid SSHWEAVE_ROUTE_STACK")?,
-        Err(std::env::VarError::NotPresent) => Vec::new(),
-        Err(error) => return Err(error.into()),
+    let mut stack: Vec<String> = match optional_env(ROUTE_STACK_ENV)? {
+        Some(value) => {
+            serde_json::from_str(&value).with_context(|| format!("invalid {ROUTE_STACK_ENV}"))?
+        }
+        None => Vec::new(),
     };
     ensure!(
-        stack.len() < 32 && !stack.iter().any(|s| s == target),
+        stack.len() < MAX_GATEWAY_DEPTH && !stack.iter().any(|s| s == target),
         "gateway cycle: {} -> {target}",
         stack.join(" -> ")
     );
     stack.push(target.into());
-    let proxy_name = match std::env::var("SSHWEAVE_ROUTE_PROXY") {
-        Ok(name) => Some(name),
-        Err(std::env::VarError::NotPresent) => host.options.proxy.clone(),
-        Err(error) => return Err(error.into()),
-    };
+    // A proxy configured on the outermost hop applies to the whole route.
+    let proxy_name = optional_env(ROUTE_PROXY_ENV)?.or_else(|| host.options.proxy.clone());
     if let Some(name) = &proxy_name {
         ensure!(
             config.document.proxies.contains_key(name),
             "unknown route proxy {name:?}"
         );
     }
-    host.options.proxy = proxy_name.clone();
-    let routes = attempt_routes(&host, &mut rand::rng());
+    host.options.proxy.clone_from(&proxy_name);
     let mut errors = Vec::new();
-    for gateway in routes {
+    for gateway in attempt_routes(&host, &mut rand::rng()) {
         let mut attempt = host.clone();
         let result = async {
             prepare(&mut attempt, &gateway).await?;
             hooks::invoke(
                 &attempt.options,
                 Event::BeforeConnect,
-                &json!({"host":attempt, "gateway":gateway}),
+                &json!({"host": attempt, "gateway": gateway}),
             )
             .await?;
             open(config, &attempt, &gateway, &stack, proxy_name.as_deref()).await
@@ -474,7 +556,7 @@ pub async fn connect(
                 hooks::invoke(
                     &attempt.options,
                     Event::OnConnectError,
-                    &json!({"host":attempt, "gateway":gateway, "error":format!("{error:#}")}),
+                    &json!({"host": attempt, "gateway": gateway, "error": format!("{error:#}")}),
                 )
                 .await?;
                 tracing::warn!(%gateway, error = %format!("{error:#}"), "route failed");

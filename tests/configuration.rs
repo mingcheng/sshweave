@@ -1,3 +1,7 @@
+//! Configuration loading, inheritance, resolution, rendering, and persistence.
+
+mod common;
+
 use anyhow::Result;
 use sshweave::{
     config::{Config, GatewayStrategy},
@@ -12,7 +16,7 @@ fn fixture(text: &str) -> Result<(TempDir, Config)> {
         dir.path().join("config.toml"),
         format!("[settings]\noutput = 'generated.conf'\nknown_hosts = 'known.json'\n{text}"),
     )?;
-    let config = Config::load(dir.path().join("config.toml"))?;
+    let config = common::load(dir.path().join("config.toml"))?;
     Ok((dir, config))
 }
 
@@ -253,7 +257,7 @@ fn includes_are_relative_sorted_and_root_overrides() -> Result<()> {
         dir.path().join("root.toml"),
         "includes=['parts/*.toml']\n[hosts.db]\nuser='root'\ninherits=['base']\ngateway_strategy='chain'",
     )?;
-    let config = Config::load(dir.path().join("root.toml"))?;
+    let config = common::load(dir.path().join("root.toml"))?;
     assert_eq!(config.files.len(), 3);
     assert_eq!(config.resolve("db")?.port, 3333);
     assert_eq!(config.resolve("db")?.user, "root");
@@ -315,10 +319,10 @@ fn includes_detect_cycles_and_missing_matches() -> Result<()> {
     let dir = tempfile::tempdir()?;
     fs::write(dir.path().join("a.toml"), "includes=['b.toml']")?;
     fs::write(dir.path().join("b.toml"), "includes=['./a.toml']")?;
-    let error = Config::load(dir.path().join("a.toml")).unwrap_err();
+    let error = common::load(dir.path().join("a.toml")).unwrap_err();
     assert!(error.to_string().contains("include cycle"));
     fs::write(dir.path().join("a.toml"), "includes=['missing*.toml']")?;
-    assert!(Config::load(dir.path().join("a.toml")).is_err());
+    assert!(common::load(dir.path().join("a.toml")).is_err());
     Ok(())
 }
 
@@ -333,7 +337,7 @@ fn proxy_definitions_merge_by_name_and_references_inherit_normally() -> Result<(
         dir.path().join("root.toml"),
         "includes=['included.toml']\n[proxies.local]\nurl='http://127.0.0.1:7890'\n[hosts.db]\nproxy='local'",
     )?;
-    let config = Config::load(dir.path().join("root.toml"))?;
+    let config = common::load(dir.path().join("root.toml"))?;
     assert_eq!(config.document.proxies.len(), 2);
     assert_eq!(
         config.document.proxies["local"].url,
@@ -354,7 +358,7 @@ fn repeated_includes_are_loaded_once() -> Result<()> {
     let dir = tempfile::tempdir()?;
     fs::write(dir.path().join("a.toml"), "includes=['b.toml','./b.toml']")?;
     fs::write(dir.path().join("b.toml"), "[hosts.x]")?;
-    assert_eq!(Config::load(dir.path().join("a.toml"))?.files.len(), 2);
+    assert_eq!(common::load(dir.path().join("a.toml"))?.files.len(), 2);
     Ok(())
 }
 
@@ -433,6 +437,7 @@ fn targets_cannot_inject_config_shell_or_options() -> Result<()> {
 
 #[test]
 fn environment_expansion_is_strict_and_preserves_shell_dollars() -> Result<()> {
+    common::isolated_home();
     assert_eq!(util::expand_env("${HOME}")?, std::env::var("HOME")?);
     assert_eq!(util::expand_env("$HOME $?")?, "$HOME $?");
     assert!(util::expand_env("${SSHWEAVE_NONEXISTENT_TEST_19654}").is_err());
@@ -588,13 +593,13 @@ fn configuration_sources_cannot_be_overwritten() -> Result<()> {
         dir.path().join("root.toml"),
         "[settings]\noutput='./root.toml'",
     )?;
-    assert!(Config::load(dir.path().join("root.toml")).is_err());
+    assert!(common::load(dir.path().join("root.toml")).is_err());
     fs::write(dir.path().join("part.toml"), "[hosts.db]")?;
     fs::write(
         dir.path().join("root.toml"),
         "includes=['part.toml']\n[settings]\noutput='part.toml'",
     )?;
-    assert!(Config::load(dir.path().join("root.toml")).is_err());
+    assert!(common::load(dir.path().join("root.toml")).is_err());
     Ok(())
 }
 

@@ -1,3 +1,6 @@
+//! Persistent state: the registry of materialized targets and the generated
+//! OpenSSH configuration, both updated under file locks with atomic replacement.
+
 use crate::{
     config::{Config, Event},
     hooks, render, util,
@@ -12,23 +15,15 @@ use std::{
     path::Path,
 };
 
-fn ensure_parent(path: &Path) -> Result<()> {
+/// Returns the parent directory of `path`, creating it (0700) if necessary.
+fn ensure_parent(path: &Path) -> Result<&Path> {
     let parent = path.parent().context("path has no parent")?;
-    if !parent.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)?;
-        }
-        #[cfg(not(unix))]
-        fs::create_dir_all(parent)?;
-    }
-    Ok(())
+    util::create_private_dir(parent)?;
+    Ok(parent)
 }
 
+/// Opens (creating 0600 if needed) and exclusively locks `path`.
+/// The lock is released when the returned file is dropped.
 fn lock(path: &Path) -> Result<File> {
     ensure_parent(path)?;
     let mut options = OpenOptions::new();
@@ -45,17 +40,20 @@ fn lock(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Replaces `path` atomically: write a 0600 temporary file in the same
+/// directory, fsync it, rename it over `path`, then fsync the directory.
 pub fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
-    ensure_parent(path)?;
-    let mut temp = tempfile::NamedTempFile::new_in(path.parent().context("missing parent")?)?;
+    let parent = ensure_parent(path)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     temp.write_all(content)?;
     temp.as_file().sync_all()?;
     temp.persist(path)
         .with_context(|| format!("replace {}", path.display()))?;
-    File::open(path.parent().context("missing parent")?)?.sync_all()?;
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 
+/// Reads the registry of materialized targets; a missing file is empty.
 pub fn known_hosts(config: &Config) -> Result<BTreeSet<String>> {
     let path = config.known_hosts()?;
     match fs::read_to_string(&path) {
@@ -72,6 +70,7 @@ pub fn known_hosts(config: &Config) -> Result<BTreeSet<String>> {
     }
 }
 
+/// Adds `targets` and every gateway they route through to the registry.
 pub fn remember(config: &Config, targets: &[String]) -> Result<()> {
     let path = config.known_hosts()?;
     let _guard = lock(&path.with_extension("json.lock"))?;
@@ -84,6 +83,11 @@ pub fn remember(config: &Config, targets: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Regenerates the OpenSSH configuration if it changed.
+///
+/// Returns `true` when the file was written. Files lacking the sshweave
+/// [`render::HEADER`] are never overwritten. Config-write hooks only run when
+/// the content actually changes.
 pub async fn sync(config: &Config, automatic_rewrite: bool) -> Result<bool> {
     let output = config.output()?;
     let lock_path = output.with_extension("conf.lock");

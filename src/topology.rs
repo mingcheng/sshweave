@@ -1,4 +1,9 @@
-use crate::{config::Config, proxy};
+//! Read-only route previews rendered as terminal trees.
+//!
+//! Every candidate route is expanded recursively without connecting, running
+//! commands, invoking hooks, or writing files.
+
+use crate::{config::Config, proxy, resolver::MAX_GATEWAY_DEPTH, util};
 use anyhow::{Context, Result, ensure};
 use ptree::{
     Color, PrintConfig, Style,
@@ -7,6 +12,7 @@ use ptree::{
 };
 use std::io::{self, IsTerminal, Write};
 
+/// Upper bound on visited targets and rendered nodes.
 const MAX_NODES: usize = 4096;
 
 fn node(text: String, children: Vec<StringItem>) -> StringItem {
@@ -18,6 +24,7 @@ fn label(text: &str) -> String {
     text.chars().flat_map(char::escape_debug).collect()
 }
 
+/// Accumulates one tree branch per fully expanded route.
 struct Planner<'a> {
     config: &'a Config,
     routes: Vec<StringItem>,
@@ -26,6 +33,11 @@ struct Planner<'a> {
 }
 
 impl Planner<'_> {
+    /// Expands every route to `target`.
+    ///
+    /// `suffix` holds the hops already planned after `target` (closest first),
+    /// and `choices` the gateway decisions made so far. A route is recorded
+    /// once it reaches a `direct` hop.
     fn visit(
         &mut self,
         target: &str,
@@ -35,7 +47,7 @@ impl Planner<'_> {
         choices: &[String],
     ) -> Result<()> {
         ensure!(
-            stack.len() < 32 && !stack.iter().any(|name| name == target),
+            stack.len() < MAX_GATEWAY_DEPTH && !stack.iter().any(|name| name == target),
             "gateway cycle/depth limit: {} -> {target}",
             stack.join(" -> ")
         );
@@ -47,17 +59,11 @@ impl Planner<'_> {
         stack.push(target.into());
         let host = self.config.resolve(target)?;
         let proxy_name = inherited_proxy.or(host.options.proxy.as_deref());
-        let endpoint = if host.hostname.contains(':') {
-            format!("[{}]", host.hostname)
-        } else {
-            host.hostname.clone()
-        };
         let destination = format!(
-            "{}  [SSH {}@{}:{}]{}",
+            "{}  [SSH {}@{}]{}",
             label(target.split('/').next().context("empty target")?),
             label(&host.user),
-            label(&endpoint),
-            host.port,
+            label(&util::authority(&host.hostname, host.port)),
             if host.options.resolve_command.is_some() {
                 " [resolve_command not executed; endpoint is provisional]"
             } else {
@@ -126,6 +132,7 @@ impl Planner<'_> {
                 self.nodes <= MAX_NODES,
                 "topology expansion exceeds {MAX_NODES} nodes"
             );
+            // Nest hops so the tree reads from the first hop down to the target.
             let mut children = Vec::new();
             for hop in hops.into_iter().rev() {
                 children = vec![node(hop, children)];
@@ -145,6 +152,7 @@ impl Planner<'_> {
     }
 }
 
+/// Builds the complete topology tree for `target`.
 fn tree(config: &Config, target: &str) -> Result<StringItem> {
     let mut planner = Planner {
         config,
@@ -159,6 +167,7 @@ fn tree(config: &Config, target: &str) -> Result<StringItem> {
     ))
 }
 
+/// Writes the topology of `target` to `output`, with ANSI styling if `styled`.
 pub fn write(
     config: &Config,
     target: &str,
@@ -195,6 +204,8 @@ pub fn write(
     Ok(())
 }
 
+/// Prints the topology of `target` to stdout, styling only on capable terminals
+/// (honoring `NO_COLOR` and `TERM=dumb`).
 pub fn print(config: &Config, target: &str, ascii: bool) -> Result<()> {
     let stdout = io::stdout();
     let styled = stdout.is_terminal()

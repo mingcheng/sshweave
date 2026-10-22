@@ -536,6 +536,7 @@ only dynamic host tokens are used for matching.
 ## Architecture and maintenance
 
 ```text
+lib.rs       Crate overview and module wiring (see `cargo doc --open`)
 main.rs      clap CLI, application use cases, subprocess exit codes
 config.rs    TOML model, include loading, validation, inheritance
 resolver.rs  Pure host resolution, patterns/aliases/captures, gateway validation, tokens
@@ -546,7 +547,8 @@ runtime.rs   TCP/proxy transport, startup detection, bidirectional relay, limits
 proxy.rs     Proxy URL validation, unauthenticated HTTP CONNECT / SOCKS5 handshakes
 hooks.rs     Templates, events, drivers (always isolated from protocol stdout)
 sockets.rs   Control-socket discovery and lifecycle
-util.rs      Strict environment/path expansion, input and unit validation
+util.rs      Strict environment/path expansion, input and unit validation, private directories
+tests/       Integration tests; tests/common isolates HOME from the developer's conf.d
 ```
 
 Generated configuration emits concrete hosts first and excludes instantiated
@@ -561,7 +563,11 @@ Run these checks from the repository root:
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 ```
+
+Lint policy lives in `Cargo.toml` (`[lints]`): public items must be documented,
+and `unsafe` code is forbidden in the library and binary.
 
 Tests cover merging, precedence, patterns, cycles, invalid input, file protection,
 atomic updates, concurrent rebuilds, hook errors, byte-level transport,

@@ -1,3 +1,7 @@
+//! Route topology previews.
+
+mod common;
+
 use anyhow::Result;
 use sshweave::{config::Config, topology};
 use std::{fs, process::Command};
@@ -13,7 +17,7 @@ fn fixture(text: &str) -> Result<(TempDir, Config)> {
              [defaults]\nuser='ops'\n{text}"
         ),
     )?;
-    let config = Config::load(path)?;
+    let config = common::load(path)?;
     Ok((dir, config))
 }
 

@@ -1,14 +1,44 @@
+//! Discovery and shutdown of OpenSSH multiplexing (ControlMaster) sockets.
+
 use crate::{
-    config::Config,
+    config::{Config, GatewayStrategy},
     resolver::{self, ResolvedHost},
     store, util,
 };
 use anyhow::{Context, Result, ensure};
-use std::{collections::BTreeSet, path::PathBuf, process::Stdio};
+use std::{collections::BTreeSet, path::PathBuf, process::Stdio, sync::LazyLock};
 use tokio::process::Command;
 
+/// `%` tokens that OpenSSH expands inside `ControlPath`.
+static CONTROL_PATH_TOKENS: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"%[%CghnpruLldi]").expect("valid token pattern"));
+
+/// Converts a `ControlPath` into a glob. Local tokens are expanded, literal
+/// text is escaped, and remote-dependent tokens become `*`.
+fn control_path_glob(host: &ResolvedHost, value: &str) -> Result<String> {
+    let mut pattern = String::new();
+    let mut end = 0;
+    for token in CONTROL_PATH_TOKENS.find_iter(value) {
+        pattern.push_str(&glob::Pattern::escape(&value[end..token.start()]));
+        let replacement = match token.as_str() {
+            "%%" => "%".into(),
+            "%n" if !resolver::is_pattern(&host.name) => glob::Pattern::escape(&host.name),
+            "%d" | "%u" | "%l" | "%L" | "%i" | "%g" => {
+                glob::Pattern::escape(&host.expand(token.as_str(), "")?)
+            }
+            _ => "*".into(),
+        };
+        pattern.push_str(&replacement);
+        end = token.end();
+    }
+    pattern.push_str(&glob::Pattern::escape(&value[end..]));
+    Ok(pattern)
+}
+
+/// Lists existing control sockets for every configured ControlPath.
+///
+/// Only actual Unix sockets are returned; other files are ignored.
 pub fn paths(config: &Config) -> Result<Vec<PathBuf>> {
-    let tokens = regex::Regex::new(r"%[%CghnpruLldi]")?;
     let cwd = std::env::current_dir()?;
     let mut patterns = BTreeSet::new();
     let mut hosts = Vec::new();
@@ -22,6 +52,7 @@ pub fn paths(config: &Config) -> Result<Vec<PathBuf>> {
     for name in config.route_targets(names)? {
         hosts.push(config.resolve(&name)?);
     }
+    // Synthetic catch-all host for a ControlPath configured only in [defaults].
     hosts.push(ResolvedHost {
         name: "*".into(),
         hostname: "*".into(),
@@ -29,30 +60,14 @@ pub fn paths(config: &Config) -> Result<Vec<PathBuf>> {
         port: 22,
         pattern: None,
         gateways: Vec::new(),
-        gateway_strategy: Default::default(),
+        gateway_strategy: GatewayStrategy::default(),
         options: config.inherit_defaults()?,
     });
     for host in hosts {
         if let Some(value) = host.options.control_path()? {
             let value = util::expand_path(&value, &cwd)?;
             let value = value.to_str().context("ControlPath is not UTF-8")?;
-            let mut pattern = String::new();
-            let mut end = 0;
-            for token in tokens.find_iter(value) {
-                pattern.push_str(&glob::Pattern::escape(&value[end..token.start()]));
-                let replacement = match token.as_str() {
-                    "%%" => "%".into(),
-                    "%n" if !resolver::is_pattern(&host.name) => glob::Pattern::escape(&host.name),
-                    "%d" | "%u" | "%l" | "%L" | "%i" | "%g" => {
-                        glob::Pattern::escape(&host.expand(token.as_str(), "")?)
-                    }
-                    _ => "*".into(),
-                };
-                pattern.push_str(&replacement);
-                end = token.end();
-            }
-            pattern.push_str(&glob::Pattern::escape(&value[end..]));
-            patterns.insert(pattern);
+            patterns.insert(control_path_glob(&host, value)?);
         }
     }
     ensure!(
@@ -80,6 +95,7 @@ pub fn paths(config: &Config) -> Result<Vec<PathBuf>> {
     Ok(sockets.into_iter().collect())
 }
 
+/// Asks each control master to exit (`ssh -O exit`) and returns how many were closed.
 pub async fn flush(config: &Config) -> Result<usize> {
     let sockets = paths(config)?;
     let mut failures = Vec::new();

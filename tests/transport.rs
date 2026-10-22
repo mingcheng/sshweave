@@ -1,8 +1,9 @@
+//! End-to-end transport, wrapper, hook, and generated-configuration behavior.
+
+mod common;
+
 use anyhow::{Context, Result};
-use sshweave::{
-    config::Config,
-    runtime::{self, RateLimiter},
-};
+use sshweave::runtime::{self, RateLimiter};
 use std::{fs, process::Stdio, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tokio::{
@@ -26,7 +27,9 @@ fn fixture(text: &str) -> Result<(TempDir, std::path::PathBuf)> {
 
 fn binary() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_sshweave"));
-    command.kill_on_drop(true);
+    command
+        .env("HOME", common::isolated_home())
+        .kill_on_drop(true);
     command
 }
 
@@ -143,7 +146,7 @@ async fn config_environment_and_cli_override_default_path() -> Result<()> {
         let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
         assert_eq!(value["hosts"][0]["name"], expected);
     }
-    let config = Config::load(&env_path)?;
+    let config = common::load(&env_path)?;
     assert_eq!(
         config.output()?,
         env_dir.path().canonicalize()?.join("generated.conf")
@@ -451,19 +454,19 @@ async fn limiter_enforces_shared_bidirectional_byte_budget() -> Result<()> {
 #[tokio::test]
 async fn resolve_command_is_argv_based_and_rejects_bad_output() -> Result<()> {
     let (_dir, path) = fixture("[hosts.test]\nresolve_command=['printf', '%s', '127.0.0.1']")?;
-    let config = Config::load(&path)?;
+    let config = common::load(&path)?;
     let mut host = config.resolve("test")?;
     runtime::prepare(&mut host, "").await?;
     assert_eq!(host.hostname, "127.0.0.1");
     let (_dir, path) = fixture("[hosts.test]\nresolve_command=['printf', 'two hosts']")?;
-    let config = Config::load(&path)?;
+    let config = common::load(&path)?;
     assert!(
         runtime::prepare(&mut config.resolve("test")?, "")
             .await
             .is_err()
     );
     let (_dir, path) = fixture("[hosts.test]\nresolve_command=['false']")?;
-    let config = Config::load(&path)?;
+    let config = common::load(&path)?;
     assert!(
         runtime::prepare(&mut config.resolve("test")?, "")
             .await
@@ -477,7 +480,7 @@ async fn control_path_expansion_handles_literal_percent_and_makes_private_dirs()
     let (dir, path) = fixture(
         "[hosts.test]\ncontrol_master_mkdir=true\n[hosts.test.ssh]\nControlPath='${HOME}/.ssh/unused'",
     )?;
-    let mut config = Config::load(&path)?;
+    let mut config = common::load(&path)?;
     config
         .document
         .hosts
@@ -661,7 +664,7 @@ proxy_command=["printf", 'SSH-2.0-chain\r\n']
             ssh.display()
         ),
     )?;
-    let config = Config::load(&path)?;
+    let config = common::load(&path)?;
     sshweave::store::sync(&config, false).await?;
     let expanded = Command::new("ssh")
         .args(["-G", "-F"])
@@ -817,7 +820,7 @@ proxy="other"
             ssh.display()
         ),
     )?;
-    let config = Config::load(&path)?;
+    let config = common::load(&path)?;
     sshweave::store::sync(&config, false).await?;
     let output = timeout(
         Duration::from_secs(5),
@@ -989,7 +992,7 @@ async fn real_openssh_accepts_generated_configuration_and_invokes_proxy() -> Res
     let (_dir, path) = fixture(&format!(
         "[hosts.test]\nhostname='127.0.0.1'\nport={port}\nuser='fixture'"
     ))?;
-    let mut config = Config::load(&path)?;
+    let mut config = common::load(&path)?;
     config.document.settings.binary = Some(env!("CARGO_BIN_EXE_sshweave").into());
     let control_path = format!(
         "{}/control/%C",
@@ -1159,7 +1162,7 @@ fn socket_discovery_ignores_regular_files() -> Result<()> {
     fs::write(dir.path().join("controls/not-a-socket"), "regular")?;
     let socket_path = dir.path().join("controls/host-22");
     let _listener = UnixListener::bind(&socket_path)?;
-    let mut config = Config::load(&path)?;
+    let mut config = common::load(&path)?;
     config.document.defaults.ssh.insert(
         "ControlPath".into(),
         sshweave::config::SshValue::Text(format!(
@@ -1193,7 +1196,7 @@ ControlPath="'{}/%n/socket-%p'"
             dir.path().display()
         ),
     )?;
-    let config = Config::load(source)?;
+    let config = common::load(source)?;
     sshweave::store::remember(&config, &["db/gateway".into()])?;
     let parent = dir.path().join("db/gateway");
     fs::create_dir_all(&parent)?;
@@ -1223,7 +1226,7 @@ fn socket_discovery_treats_path_metacharacters_literally() -> Result<()> {
             parent.display()
         ),
     )?;
-    let config = Config::load(source)?;
+    let config = common::load(source)?;
     assert_eq!(sshweave::sockets::paths(&config)?, vec![socket_path]);
     Ok(())
 }
@@ -1242,7 +1245,7 @@ IdentityFile=["~/.ssh/specific"]
 LocalForward=["9090 localhost:90"]
 "#,
     )?;
-    let config = Config::load(&path)?;
+    let config = common::load(&path)?;
     sshweave::store::sync(&config, false).await?;
     let output = Command::new("ssh")
         .arg("-G")

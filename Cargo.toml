@@ -12,6 +12,7 @@ documentation = "https://github.com/mingcheng/sshweave/blob/HEAD/examples/README
 authors = ["mingcheng <mingcheng@apache.org>"]
 keywords = ["ssh", "openssh", "cli", "proxy", "gateway"]
 categories = ["command-line-utilities", "config", "network-programming"]
+exclude = [".github/", ".vscode/", ".editorconfig", ".gitattributes"]
 
 [[bin]]
 name = "sshweave"
@@ -35,10 +36,30 @@ serde_json = "1"
 sha1 = "0.11"
 shell-words = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = [
+  "io-std",
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
 toml = { version = "1.1", features = ["preserve_order"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints.rust]
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+dbg_macro = "warn"
+format_push_string = "warn"
+todo = "warn"
+uninlined_format_args = "warn"
 
 [profile.release]
 lto = "thin"

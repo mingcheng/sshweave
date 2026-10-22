@@ -1,3 +1,6 @@
+//! Host resolution: matching literal names, aliases, globs, and regular
+//! expressions, then layering inheritance and defaults into a [`ResolvedHost`].
+
 use crate::{
     config::{Config, GatewayStrategy, Host},
     util,
@@ -7,14 +10,24 @@ use serde::Serialize;
 use sha1::{Digest, Sha1};
 use std::{collections::BTreeSet, fmt::Write};
 
+/// Maximum depth of nested gateway routes (shared by validation, topology,
+/// and the runtime cycle guard).
+pub const MAX_GATEWAY_DEPTH: usize = 32;
+
+/// Maximum number of distinct targets reachable through gateway expansion.
+const MAX_ROUTE_TARGETS: usize = 4096;
+
+/// Returns whether `name` is a glob or `regex:` pattern rather than a literal.
 pub fn is_pattern(name: &str) -> bool {
     name.starts_with("regex:") || name.contains(['*', '?', '['])
 }
 
+/// Compiles a `regex:` body anchored to the whole name.
 fn compile_regex(expr: &str) -> Result<regex::Regex> {
     Ok(regex::Regex::new(&format!(r"\A(?:{expr})\z"))?)
 }
 
+/// Validates a host name, alias, or pattern from the configuration.
 pub fn validate_pattern(pattern: &str) -> Result<()> {
     ensure!(!pattern.is_empty(), "empty host pattern");
     util::single_line(pattern)?;
@@ -31,6 +44,7 @@ pub fn validate_pattern(pattern: &str) -> Result<()> {
     Ok(())
 }
 
+/// Tests whether `name` matches a glob or `regex:` pattern.
 pub fn matches(pattern: &str, name: &str) -> Result<bool> {
     if let Some(expr) = pattern.strip_prefix("regex:") {
         Ok(compile_regex(expr)?.is_match(name))
@@ -39,15 +53,24 @@ pub fn matches(pattern: &str, name: &str) -> Result<bool> {
     }
 }
 
+/// A target with every inherited and default value applied.
 #[derive(Clone, Debug, Serialize)]
 pub struct ResolvedHost {
+    /// The requested target, including any explicit `/gateway` chain.
     pub name: String,
+    /// The `[hosts]` key that matched first, if any.
     pub pattern: Option<String>,
+    /// Final network address.
     pub hostname: String,
+    /// Final login user.
     pub user: String,
+    /// Final SSH port.
     pub port: u16,
+    /// Gateway candidates (an explicit chain overrides configured gateways).
     pub gateways: Vec<String>,
+    /// How [`ResolvedHost::gateways`] are tried.
     pub gateway_strategy: GatewayStrategy,
+    /// The merged options the values above were derived from.
     pub options: Host,
 }
 
@@ -70,6 +93,10 @@ impl ResolvedHost {
         }
     }
 
+    /// Expands `${ENV}`, a leading `~`, and OpenSSH-style `%` tokens.
+    ///
+    /// Supported tokens: `%%`, `%h`, `%n`, `%p`, `%r`, `%g` (current gateway),
+    /// `%u`, `%i`, `%d`, `%l`, `%L`, and `%C`. Unknown tokens are kept verbatim.
     pub fn expand(&self, value: &str, gateway: &str) -> Result<String> {
         let local_user = std::env::var("USER").context("USER is not set")?;
         let home = std::env::var("HOME").context("HOME is not set")?;
@@ -120,12 +147,34 @@ impl ResolvedHost {
         Ok(result)
     }
 
+    /// Returns a compact `user@hostname:port` summary.
     pub fn prototype(&self) -> String {
         format!("{}@{}:{}", self.user, self.hostname, self.port)
     }
 }
 
+/// Replaces `{0}`, `{1}`, ... and `{name}` in `hostname` with regex captures.
+fn substitute_captures(hostname: &mut String, expr: &str, name: &str) -> Result<()> {
+    let re = compile_regex(expr)?;
+    let Some(captures) = re.captures(name) else {
+        return Ok(());
+    };
+    for (index, capture) in captures.iter().enumerate() {
+        if let Some(value) = capture {
+            *hostname = hostname.replace(&format!("{{{index}}}"), value.as_str());
+        }
+    }
+    for key in re.capture_names().flatten() {
+        if let Some(value) = captures.name(key) {
+            *hostname = hostname.replace(&format!("{{{key}}}"), value.as_str());
+        }
+    }
+    Ok(())
+}
+
 impl Config {
+    /// Returns whether `target` needs its own generated stanza: explicit
+    /// chains and names matched only through patterns.
     pub fn requires_materialization(&self, target: &str) -> Result<bool> {
         if target.contains('/') {
             return Ok(true);
@@ -140,6 +189,7 @@ impl Config {
         Ok(false)
     }
 
+    /// Resolves a `[hosts]` key exactly as written, including pattern keys.
     pub fn entry(&self, name: &str) -> Result<ResolvedHost> {
         ensure!(
             self.document.hosts.contains_key(name),
@@ -148,11 +198,16 @@ impl Config {
         self.resolve_inner(name)
     }
 
+    /// Validates and resolves a user-supplied target.
     pub fn resolve(&self, target: &str) -> Result<ResolvedHost> {
         util::valid_target(target)?;
         self.resolve_inner(target)
     }
 
+    /// Resolves without target validation (pattern keys are not valid targets).
+    ///
+    /// Matching entries are layered in priority order: the exact host key,
+    /// then literal aliases, then patterns in configuration order.
     pub(crate) fn resolve_inner(&self, target: &str) -> Result<ResolvedHost> {
         let mut parts = target.splitn(2, '/');
         let name = parts.next().context("empty target")?;
@@ -189,19 +244,7 @@ impl Config {
             if let Some(hostname) = &mut incoming.hostname
                 && let Some(expr) = candidate.strip_prefix("regex:")
             {
-                let re = compile_regex(expr)?;
-                if let Some(captures) = re.captures(name) {
-                    for (index, capture) in captures.iter().enumerate() {
-                        if let Some(value) = capture {
-                            *hostname = hostname.replace(&format!("{{{index}}}"), value.as_str());
-                        }
-                    }
-                    for key in re.capture_names().flatten() {
-                        if let Some(value) = captures.name(key) {
-                            *hostname = hostname.replace(&format!("{{{key}}}"), value.as_str());
-                        }
-                    }
-                }
+                substitute_captures(hostname, expr, name)?;
             }
             if index == 0 {
                 options = incoming;
@@ -234,9 +277,10 @@ impl Config {
             !user.is_empty() && !user.chars().any(char::is_whitespace),
             "invalid user"
         );
-        let gateways = chain
-            .map(|s| vec![s.to_owned()])
-            .unwrap_or_else(|| options.gateways.clone().unwrap_or_default());
+        let gateways = chain.map_or_else(
+            || options.gateways.clone().unwrap_or_default(),
+            |s| vec![s.to_owned()],
+        );
         let gateway_strategy = if chain.is_some() {
             GatewayStrategy::Sequential
         } else {
@@ -262,10 +306,11 @@ impl Config {
         Ok(host)
     }
 
+    /// Rejects gateway cycles and overly deep routes for every configured host.
     pub(crate) fn validate_gateway_graph(&self) -> Result<()> {
         fn visit(config: &Config, target: &str, stack: &mut Vec<String>) -> Result<()> {
             ensure!(
-                stack.len() < 32 && !stack.iter().any(|x| x == target),
+                stack.len() < MAX_GATEWAY_DEPTH && !stack.iter().any(|x| x == target),
                 "gateway cycle/depth limit: {} -> {target}",
                 stack.join(" -> ")
             );
@@ -285,6 +330,7 @@ impl Config {
         Ok(())
     }
 
+    /// Literal host names and aliases (patterns excluded).
     pub fn concrete_names(&self) -> BTreeSet<String> {
         self.document
             .hosts
@@ -295,6 +341,8 @@ impl Config {
             .collect()
     }
 
+    /// Expands targets with every gateway and chain component they can route
+    /// through, so each one gets a generated stanza.
     pub fn route_targets(
         &self,
         targets: impl IntoIterator<Item = String>,
@@ -306,7 +354,10 @@ impl Config {
             if !visited.insert(target.clone()) {
                 continue;
             }
-            ensure!(visited.len() <= 4096, "too many expanded gateway targets");
+            ensure!(
+                visited.len() <= MAX_ROUTE_TARGETS,
+                "too many expanded gateway targets"
+            );
             if let Some((first, rest)) = target.split_once('/') {
                 pending.push(first.into());
                 pending.push(rest.into());

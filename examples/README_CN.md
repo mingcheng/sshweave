@@ -464,6 +464,7 @@ ControlPath 中的字面 `*`、`?`、`[]` 不作为 glob 展开，只有动态�
 ## 分层与维护
 
 ```text
+lib.rs       crate 总览与模块组织（可用 `cargo doc --open` 查看）
 main.rs      clap CLI、应用用例、子进程退出码
 config.rs    TOML 模型、include 装载、结构验证、继承
 resolver.rs  纯主机解析、模式/alias/capture、网关图验证、token
@@ -474,7 +475,8 @@ runtime.rs   TCP/代理传输、启动检测、双向 relay、限速、连接统
 proxy.rs     独立代理 URL 校验、HTTP CONNECT / SOCKS5 无认证握手
 hooks.rs     模板、事件与驱动执行（始终隔离协议 stdout）
 sockets.rs   控制 socket 发现与生命周期管理
-util.rs      严格环境/路径展开、输入和单位验证
+util.rs      严格环境/路径展开、输入和单位验证、私有目录创建
+tests/       集成测试；tests/common 隔离 HOME，避免读取开发者本机的 conf.d
 ```
 
 生成文件优先输出具体主机，通配规则排除已实例化的主机，避免 OpenSSH
@@ -486,7 +488,10 @@ util.rs      严格环境/路径展开、输入和单位验证
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 ```
+
+lint 策略位于 `Cargo.toml` 的 `[lints]`：公开项必须有文档注释，库和可执行文件禁止 `unsafe` 代码。
 
 测试覆盖配置合并、优先级、模式、循环、无效输入、文件保护、原子更新、
 并发重建、hook 错误、字节级传输、半关闭、远端提前断开、共享限速阈值、

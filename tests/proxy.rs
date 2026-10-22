@@ -1,3 +1,7 @@
+//! HTTP CONNECT and SOCKS5 proxy transports.
+
+mod common;
+
 use anyhow::{Context, Result};
 use sshweave::proxy::Endpoint;
 use std::{fs, process::Stdio, time::Duration};
@@ -25,6 +29,7 @@ async fn connect(config: &str, payload: &[u8]) -> Result<std::process::Output> {
         format!("[settings]\noutput='generated.conf'\nknown_hosts='known.json'\n{config}"),
     )?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_sshweave"))
+        .env("HOME", common::isolated_home())
         .arg("-c")
         .arg(&path)
         .args(["connect", "--no-rewrite", "db"])
@@ -84,7 +89,7 @@ fn invalid_proxy_urls_are_rejected_before_connecting() -> Result<()> {
             format!("[proxies.invalid]\nurl={}", serde_json::to_string(url)?),
         )?;
         assert!(
-            sshweave::config::Config::load(&source).is_err(),
+            common::load(&source).is_err(),
             "config check accepted invalid proxy"
         );
     }

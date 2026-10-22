@@ -1,3 +1,7 @@
+//! `sshweave` command-line interface.
+
+#![forbid(unsafe_code)]
+
 use anyhow::{Context, Result, ensure};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde_json::json;
@@ -11,12 +15,18 @@ use std::{
 };
 use tokio::{process::Command, time::Instant};
 
+/// Port numbers accepted on the command line (0 is rejected).
+fn port_parser() -> clap::builder::RangedI64ValueParser<u16> {
+    clap::value_parser!(u16).range(1..)
+}
+
 #[derive(Parser, Debug)]
 #[command(
     version,
     about = "Composable SSH configuration and resilient gateway routing"
 )]
 struct Cli {
+    /// Root configuration file.
     #[arg(
         long,
         short = 'c',
@@ -24,8 +34,10 @@ struct Cli {
         default_value = "~/.config/sshweave/sshweave.toml"
     )]
     config: PathBuf,
+    /// Log informational messages.
     #[arg(long, short = 'v')]
     verbose: bool,
+    /// Log debug messages.
     #[arg(long, env = "SSHWEAVE_DEBUG")]
     debug: bool,
     #[command(subcommand)]
@@ -42,12 +54,16 @@ enum Commands {
     /// Raw byte transport used by OpenSSH ProxyCommand.
     Connect {
         target: String,
-        #[arg(long, short = 'p')]
+        /// Override the destination port (OpenSSH passes %p).
+        #[arg(long, short = 'p', value_parser = port_parser())]
         port: Option<u16>,
+        /// Override the destination user (OpenSSH passes %r).
         #[arg(long)]
         user: Option<String>,
+        /// Do not regenerate the OpenSSH configuration before connecting.
         #[arg(long)]
         no_rewrite: bool,
+        /// Print the resolved host and routes without connecting.
         #[arg(long)]
         dry_run: bool,
     },
@@ -83,10 +99,13 @@ enum Commands {
 enum ConfigCommand {
     /// Render OpenSSH configuration to stdout, or write a managed output file.
     Build {
+        /// Write settings.output instead of printing.
         #[arg(long)]
         write: bool,
+        /// Generate a ProxyCommand that never regenerates configuration.
         #[arg(long)]
         no_automatic_rewrite: bool,
+        /// Omit materialized targets from the registry (stdout only).
         #[arg(long)]
         ignore_known_hosts: bool,
     },
@@ -94,11 +113,13 @@ enum ConfigCommand {
     Check,
     /// Export the combined configuration, or resolved concrete hosts.
     Json {
+        /// Export resolved concrete hosts instead of the merged document.
         #[arg(long, short = 'e')]
         expand: bool,
     },
     /// List hosts, aliases, and patterns.
     List {
+        /// Print resolved hosts as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -110,7 +131,8 @@ enum ConfigCommand {
     Resolve { target: String },
 }
 
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+/// Programs supported by `sshweave wrapper`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Program {
     Ssh,
     Scp,
@@ -118,10 +140,45 @@ enum Program {
     Rsync,
 }
 
+impl Program {
+    /// Short options that consume an argument, per the program's manual.
+    fn short_options_with_value(self) -> &'static str {
+        match self {
+            Self::Ssh => "BbcDEeFIiJLlmOopQRSWw",
+            Self::Scp => "cDFiJloPSX",
+            Self::Sftp => "BbcDFiJloPRSs",
+            Self::Rsync => "BefMT@",
+        }
+    }
+}
+
+/// rsync long options whose value is a separate argument.
+const RSYNC_LONG_OPTIONS_WITH_VALUE: &[&str] = &[
+    "--exclude",
+    "--include",
+    "--filter",
+    "--files-from",
+    "--exclude-from",
+    "--include-from",
+    "--log-file",
+    "--out-format",
+    "--chmod",
+    "--chown",
+    "--bwlimit",
+    "--timeout",
+    "--contimeout",
+    "--password-file",
+    "--rsync-path",
+    "--remote-option",
+];
+
 #[derive(Subcommand, Debug)]
 enum SocketCommand {
+    /// List existing control sockets.
     List,
+    /// Ask every control master to exit.
     Flush,
+    /// Start background control masters for targets.
     Master {
         #[arg(required = true)]
         targets: Vec<String>,
@@ -131,26 +188,31 @@ enum SocketCommand {
 #[derive(Args, Debug)]
 struct PingArgs {
     target: String,
-    #[arg(long, short = 'p')]
+    /// Override the destination port.
+    #[arg(long, short = 'p', value_parser = port_parser())]
     port: Option<u16>,
+    /// Number of probes; 0 runs until interrupted.
     #[arg(long, short = 'n', default_value_t = 4)]
     count: u32,
+    /// Seconds between probes.
     #[arg(long, short = 'i', default_value_t = 1.0)]
     interval: f64,
+    /// Per-probe timeout in seconds; 0 disables it.
     #[arg(long, short = 'W', default_value_t = 1)]
     timeout: u64,
+    /// Stop after the first successful probe.
     #[arg(long, short = 'o')]
     once: bool,
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<()> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = io::stdout().lock();
     serde_json::to_writer_pretty(&mut out, value)?;
     writeln!(out)?;
     Ok(())
 }
 
+/// Resolves every concrete and materialized host.
 fn expanded(config: &Config) -> Result<serde_json::Value> {
     let mut names = config.concrete_names();
     names.extend(store::known_hosts(config)?);
@@ -158,104 +220,24 @@ fn expanded(config: &Config) -> Result<serde_json::Value> {
         .iter()
         .map(|name| config.resolve(name))
         .collect::<Result<Vec<_>>>()?;
-    Ok(json!({"hosts": hosts, "templates": config.document.templates, "files":config.files}))
+    Ok(json!({"hosts": hosts, "templates": config.document.templates, "files": config.files}))
 }
 
+/// Runs the CLI and returns the process exit code.
 async fn run(cli: Cli) -> Result<i32> {
-    if let Commands::Completions { shell } = cli.command {
-        clap_complete::generate(shell, &mut Cli::command(), "sshweave", &mut io::stdout());
-        return Ok(0);
-    }
-    let config = Config::load(&cli.config)?;
-    match cli.command {
-        Commands::Config { command } => match command {
-            ConfigCommand::Build {
-                write,
-                no_automatic_rewrite,
-                ignore_known_hosts,
-            } => {
-                let automatic = config.document.settings.automatic_rewrite && !no_automatic_rewrite;
-                ensure!(
-                    !(write && ignore_known_hosts),
-                    "--ignore-known-hosts cannot be combined with --write"
-                );
-                if write {
-                    let changed = store::sync(&config, automatic).await?;
-                    eprintln!(
-                        "{} {}",
-                        if changed { "Updated" } else { "Unchanged" },
-                        config.output()?.display()
-                    );
-                } else {
-                    let known = if ignore_known_hosts {
-                        BTreeSet::new()
-                    } else {
-                        store::known_hosts(&config)?
-                    };
-                    io::stdout()
-                        .write_all(render::ssh_config(&config, &known, automatic)?.as_bytes())?;
-                }
-            }
-            ConfigCommand::Check => println!(
-                "Configuration valid ({} hosts, {} templates, {} files)",
-                config.document.hosts.len(),
-                config.document.templates.len(),
-                config.files.len()
-            ),
-            ConfigCommand::Json { expand } => {
-                if expand {
-                    print_json(&expanded(&config)?)?;
-                } else {
-                    print_json(&config)?;
-                }
-            }
-            ConfigCommand::Resolve { target } => print_json(&config.resolve(&target)?)?,
-            ConfigCommand::List { json: true } => print_json(&expanded(&config)?)?,
-            ConfigCommand::List { json: false } => {
-                for name in config.document.hosts.keys() {
-                    let host = config.entry(name)?;
-                    println!("{name} -> {}", host.prototype());
-                    if !host.options.aliases.is_empty() {
-                        println!("  aliases: {}", host.options.aliases.join(", "));
-                    }
-                    if !host.gateways.is_empty() {
-                        println!("  gateways: {}", host.gateways.join(", "));
-                        println!("  gateway_strategy: {}", host.gateway_strategy.as_str());
-                    }
-                    if let Some(proxy) = &host.options.proxy {
-                        println!("  proxy: {proxy}");
-                    }
-                }
-            }
-            ConfigCommand::Search { query } => {
-                let needle = query.to_lowercase();
-                for (name, raw) in &config.document.hosts {
-                    let host = config.entry(name)?;
-                    if format!(
-                        "{name} {} {:?} {:?}",
-                        host.prototype(),
-                        raw.aliases,
-                        raw.comment
-                    )
-                    .to_lowercase()
-                    .contains(&needle)
-                    {
-                        println!("{name} -> {}", host.prototype());
-                    }
-                }
-            }
-            ConfigCommand::Graphviz => {
-                io::stdout().write_all(render::graphviz(&config)?.as_bytes())?
-            }
-        },
-        Commands::Info => print_json(&json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "os": std::env::consts::OS, "arch":std::env::consts::ARCH,
-            "executable":std::env::current_exe()?, "source":config.source,
-            "output":config.output()?, "known_hosts":config.known_hosts()?,
-            "files":config.files, "hosts":config.document.hosts.len(), "templates":config.document.templates.len(),
-            "proxies":config.document.proxies.len()
-        }))?,
+    let Cli {
+        config: path,
+        command,
+        ..
+    } = cli;
+    // Completions must work without a configuration file, so load lazily.
+    let load = || Config::load(&path);
+    match command {
+        Commands::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "sshweave", &mut io::stdout());
+        }
+        Commands::Config { command } => config_command(&load()?, command).await?,
+        Commands::Info => info(&load()?)?,
         Commands::Connect {
             target,
             port,
@@ -263,83 +245,188 @@ async fn run(cli: Cli) -> Result<i32> {
             no_rewrite,
             dry_run,
         } => {
-            let host = config.resolve(&target)?;
+            let config = load()?;
             if dry_run {
-                let mut host = host;
+                let mut host = config.resolve(&target)?;
                 if let Some(port) = port {
-                    ensure!(port > 0, "port must be positive");
                     host.port = port;
                 }
                 if let Some(user) = user {
                     host.user = user;
                 }
-                print_json(&json!({"host":host, "routes":host.routes()}))?;
+                print_json(&json!({"host": host, "routes": host.routes()}))?;
             } else {
-                if !no_rewrite && config.document.settings.automatic_rewrite {
-                    if config.requires_materialization(&target)? {
-                        store::remember(&config, std::slice::from_ref(&target))?;
-                    }
-                    if store::sync(&config, true).await? {
-                        anyhow::bail!(
-                            "configuration updated after OpenSSH read it; retry SSH, or use `sshweave wrapper ssh` to apply changes before connecting"
-                        );
-                    }
-                }
-                runtime::connect(&config, &target, port, user.as_deref()).await?;
+                connect(&config, &target, port, user.as_deref(), no_rewrite).await?;
             }
         }
-        Commands::Wrapper { program, args } => return wrapper(&config, program, args).await,
-        Commands::Ping(args) => ping(&config, args).await?,
-        Commands::Topology { target, ascii } => {
-            topology::print(&config, &target, ascii)?;
-        }
-        Commands::Sockets { command } => match command {
-            SocketCommand::List => {
-                for path in sockets::paths(&config)? {
-                    println!("{}", path.display());
-                }
-            }
-            SocketCommand::Flush => {
-                println!("Closed {} control sockets", sockets::flush(&config).await?)
-            }
-            SocketCommand::Master { targets } => {
-                for target in &targets {
-                    config.resolve(target)?;
-                }
-                store::remember(&config, &targets)?;
-                store::sync(&config, config.document.settings.automatic_rewrite).await?;
-                for target in targets {
-                    let host = config.resolve(&target)?;
-                    runtime::prepare_control_path(&host)?;
-                    let status = Command::new(config.ssh_binary()?)
-                        .arg("-F")
-                        .arg(config.output()?)
-                        .args(["-M", "-N", "-f", "--"])
-                        .arg(&target)
-                        .status()
-                        .await
-                        .context("start master SSH connection")?;
-                    ensure!(status.success(), "ssh master {target} exited with {status}");
-                }
-            }
-        },
-        Commands::Completions { .. } => unreachable!(),
+        Commands::Wrapper { program, args } => return wrapper(&load()?, program, args).await,
+        Commands::Ping(args) => ping(&load()?, args).await?,
+        Commands::Topology { target, ascii } => topology::print(&load()?, &target, ascii)?,
+        Commands::Sockets { command } => sockets_command(&load()?, command).await?,
     }
     Ok(0)
 }
 
-/// Locate destinations without interpreting or modifying the remote command.
+async fn config_command(config: &Config, command: ConfigCommand) -> Result<()> {
+    match command {
+        ConfigCommand::Build {
+            write,
+            no_automatic_rewrite,
+            ignore_known_hosts,
+        } => {
+            ensure!(
+                !(write && ignore_known_hosts),
+                "--ignore-known-hosts cannot be combined with --write"
+            );
+            let automatic = config.document.settings.automatic_rewrite && !no_automatic_rewrite;
+            if write {
+                let changed = store::sync(config, automatic).await?;
+                eprintln!(
+                    "{} {}",
+                    if changed { "Updated" } else { "Unchanged" },
+                    config.output()?.display()
+                );
+            } else {
+                let known = if ignore_known_hosts {
+                    BTreeSet::new()
+                } else {
+                    store::known_hosts(config)?
+                };
+                io::stdout()
+                    .write_all(render::ssh_config(config, &known, automatic)?.as_bytes())?;
+            }
+        }
+        ConfigCommand::Check => println!(
+            "Configuration valid ({} hosts, {} templates, {} files)",
+            config.document.hosts.len(),
+            config.document.templates.len(),
+            config.files.len()
+        ),
+        ConfigCommand::Json { expand: true } | ConfigCommand::List { json: true } => {
+            print_json(&expanded(config)?)?;
+        }
+        ConfigCommand::Json { expand: false } => print_json(config)?,
+        ConfigCommand::Resolve { target } => print_json(&config.resolve(&target)?)?,
+        ConfigCommand::List { json: false } => {
+            for name in config.document.hosts.keys() {
+                let host = config.entry(name)?;
+                println!("{name} -> {}", host.prototype());
+                if !host.options.aliases.is_empty() {
+                    println!("  aliases: {}", host.options.aliases.join(", "));
+                }
+                if !host.gateways.is_empty() {
+                    println!("  gateways: {}", host.gateways.join(", "));
+                    println!("  gateway_strategy: {}", host.gateway_strategy.as_str());
+                }
+                if let Some(proxy) = &host.options.proxy {
+                    println!("  proxy: {proxy}");
+                }
+            }
+        }
+        ConfigCommand::Search { query } => {
+            let needle = query.to_lowercase();
+            for (name, raw) in &config.document.hosts {
+                let host = config.entry(name)?;
+                let haystack = format!(
+                    "{name} {} {:?} {:?}",
+                    host.prototype(),
+                    raw.aliases,
+                    raw.comment
+                );
+                if haystack.to_lowercase().contains(&needle) {
+                    println!("{name} -> {}", host.prototype());
+                }
+            }
+        }
+        ConfigCommand::Graphviz => io::stdout().write_all(render::graphviz(config)?.as_bytes())?,
+    }
+    Ok(())
+}
+
+fn info(config: &Config) -> Result<()> {
+    print_json(&json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "executable": std::env::current_exe()?,
+        "source": config.source,
+        "output": config.output()?,
+        "known_hosts": config.known_hosts()?,
+        "files": config.files,
+        "hosts": config.document.hosts.len(),
+        "templates": config.document.templates.len(),
+        "proxies": config.document.proxies.len(),
+    }))
+}
+
+/// `sshweave connect`: refresh the generated configuration if allowed, then relay.
+async fn connect(
+    config: &Config,
+    target: &str,
+    port: Option<u16>,
+    user: Option<&str>,
+    no_rewrite: bool,
+) -> Result<()> {
+    // Validate the target before it can be written to the registry.
+    config.resolve(target)?;
+    if !no_rewrite && config.document.settings.automatic_rewrite {
+        if config.requires_materialization(target)? {
+            store::remember(config, &[target.to_owned()])?;
+        }
+        // OpenSSH has already parsed the old file, so a changed file cannot
+        // take effect for this connection.
+        ensure!(
+            !store::sync(config, true).await?,
+            "configuration updated after OpenSSH read it; retry SSH, or use `sshweave wrapper ssh` to apply changes before connecting"
+        );
+    }
+    runtime::connect(config, target, port, user).await
+}
+
+async fn sockets_command(config: &Config, command: SocketCommand) -> Result<()> {
+    match command {
+        SocketCommand::List => {
+            for path in sockets::paths(config)? {
+                println!("{}", path.display());
+            }
+        }
+        SocketCommand::Flush => {
+            println!("Closed {} control sockets", sockets::flush(config).await?);
+        }
+        SocketCommand::Master { targets } => {
+            for target in &targets {
+                config.resolve(target)?;
+            }
+            store::remember(config, &targets)?;
+            store::sync(config, config.document.settings.automatic_rewrite).await?;
+            for target in targets {
+                let host = config.resolve(&target)?;
+                runtime::prepare_control_path(&host)?;
+                let status = Command::new(config.ssh_binary()?)
+                    .arg("-F")
+                    .arg(config.output()?)
+                    .args(["-M", "-N", "-f", "--"])
+                    .arg(&target)
+                    .status()
+                    .await
+                    .context("start master SSH connection")?;
+                ensure!(status.success(), "ssh master {target} exited with {status}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Locates destinations without interpreting or modifying the remote command.
+///
+/// Rejects options that would bypass the generated configuration (`-F`,
+/// routing overrides via `-o`, and rsync's remote shell).
 fn wrapper_targets(program: Program, args: &[String]) -> Result<Vec<String>> {
     let mut positionals = Vec::new();
     let mut skip = false;
     let mut pending_option = None;
     let mut options = true;
-    let takes_value = match program {
-        Program::Ssh => "BbcDEeFIiJLlmOopQRSWw",
-        Program::Scp => "cDFiJloPSX",
-        Program::Sftp => "BbcDFiJloPRSs",
-        Program::Rsync => "BefMT@",
-    };
+    let takes_value = program.short_options_with_value();
     for arg in args {
         if skip {
             if pending_option == Some('o') {
@@ -354,32 +441,14 @@ fn wrapper_targets(program: Program, args: &[String]) -> Result<Vec<String>> {
             continue;
         }
         if options && arg.starts_with('-') && arg != "-" {
-            if matches!(program, Program::Rsync) && arg.starts_with("--") {
+            if program == Program::Rsync && arg.starts_with("--") {
                 ensure!(
                     !["-e", "--rsh", "--config"]
                         .iter()
                         .any(|key| arg == key || arg.starts_with(&format!("{key}="))),
                     "wrapper manages rsync remote shell"
                 );
-                skip = [
-                    "--exclude",
-                    "--include",
-                    "--filter",
-                    "--files-from",
-                    "--exclude-from",
-                    "--include-from",
-                    "--log-file",
-                    "--out-format",
-                    "--chmod",
-                    "--chown",
-                    "--bwlimit",
-                    "--timeout",
-                    "--contimeout",
-                    "--password-file",
-                    "--rsync-path",
-                    "--remote-option",
-                ]
-                .contains(&arg.as_str());
+                skip = RSYNC_LONG_OPTIONS_WITH_VALUE.contains(&arg.as_str());
             } else {
                 // OpenSSH permits clusters such as -vvvp2222 and -vp 2222.
                 let flags = &arg[1..];
@@ -387,7 +456,7 @@ fn wrapper_targets(program: Program, args: &[String]) -> Result<Vec<String>> {
                     if takes_value.contains(flag) {
                         ensure!(flag != 'F', "wrapper manages the SSH -F configuration");
                         ensure!(
-                            !(matches!(program, Program::Rsync) && flag == 'e'),
+                            !(program == Program::Rsync && flag == 'e'),
                             "wrapper manages rsync remote shell"
                         );
                         skip = offset + flag.len_utf8() == flags.len();
@@ -404,7 +473,7 @@ fn wrapper_targets(program: Program, args: &[String]) -> Result<Vec<String>> {
             continue;
         }
         positionals.push(arg.as_str());
-        if matches!(program, Program::Ssh) {
+        if program == Program::Ssh {
             break;
         }
     }
@@ -421,6 +490,7 @@ fn wrapper_targets(program: Program, args: &[String]) -> Result<Vec<String>> {
     Ok(targets)
 }
 
+/// Rejects `-o` overrides that would bypass sshweave routing.
 fn check_ssh_override(value: &str) -> Result<()> {
     let key = value.split(['=', ' ', '\t']).next().unwrap_or(value);
     ensure!(
@@ -430,6 +500,8 @@ fn check_ssh_override(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Extracts the host from a destination argument (`[user@]host[:path]` or an
+/// `ssh://`/`scp://`/`sftp://` URI). Returns `None` for local paths.
 fn destination(program: Program, value: &str) -> Result<Option<&str>> {
     let uri = value.split_once("://");
     let authority = if let Some((scheme, rest)) = uri {
@@ -454,7 +526,7 @@ fn destination(program: Program, value: &str) -> Result<Option<&str>> {
     if uri.is_some() {
         return Ok(host.split(':').next());
     }
-    if matches!(program, Program::Ssh) {
+    if program == Program::Ssh {
         return Ok(Some(host));
     }
     if matches!(program, Program::Sftp) {
@@ -466,14 +538,15 @@ fn destination(program: Program, value: &str) -> Result<Option<&str>> {
         .filter(|h| !h.contains('/')))
 }
 
+/// `sshweave wrapper`: register targets, refresh the configuration, then run
+/// the program against it. Returns the program's exit code.
 async fn wrapper(config: &Config, program: Program, args: Vec<String>) -> Result<i32> {
     ensure!(!args.is_empty(), "wrapper requires program arguments");
     let targets = wrapper_targets(program, &args)?;
     store::remember(config, &targets)?;
     store::sync(config, config.document.settings.automatic_rewrite).await?;
     for target in &targets {
-        let host = config.resolve(target)?;
-        runtime::prepare_control_path(&host)?;
+        runtime::prepare_control_path(&config.resolve(target)?)?;
     }
     let output = config.output()?;
     let mut command = match program {
@@ -482,7 +555,7 @@ async fn wrapper(config: &Config, program: Program, args: Vec<String>) -> Result
         Program::Sftp => Command::new("sftp"),
         Program::Rsync => Command::new("rsync"),
     };
-    if matches!(program, Program::Rsync) {
+    if program == Program::Rsync {
         let ssh_binary = config.ssh_binary()?;
         let rsh = shell_words::join([
             ssh_binary
@@ -506,9 +579,10 @@ async fn wrapper(config: &Config, program: Program, args: Vec<String>) -> Result
     Ok(status.code().unwrap_or(1))
 }
 
+/// `sshweave ping`: measure TCP connect latency to a direct route.
 async fn ping(config: &Config, args: PingArgs) -> Result<()> {
     ensure!(
-        args.interval.is_finite() && args.interval >= 0.0 && args.interval <= 86400.0,
+        args.interval.is_finite() && (0.0..=86400.0).contains(&args.interval),
         "interval must be 0..86400 seconds"
     );
     let mut host = config.resolve(&args.target)?;
@@ -519,7 +593,6 @@ async fn ping(config: &Config, args: PingArgs) -> Result<()> {
         "ping supports direct TCP routes only"
     );
     if let Some(port) = args.port {
-        ensure!(port > 0, "port must be positive");
         host.port = port;
     }
     runtime::prepare(&mut host, "").await?;
@@ -529,13 +602,10 @@ async fn ping(config: &Config, args: PingArgs) -> Result<()> {
     );
     let mut attempts = 0u32;
     let mut timings = Vec::new();
-    loop {
-        if args.count != 0 && attempts >= args.count {
-            break;
-        }
+    while args.count == 0 || attempts < args.count {
         if attempts > 0 {
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs_f64(args.interval)) => {}
+                () = tokio::time::sleep(Duration::from_secs_f64(args.interval)) => {}
                 result = tokio::signal::ctrl_c() => { result?; break; }
             }
         }
@@ -558,25 +628,28 @@ async fn ping(config: &Config, args: PingArgs) -> Result<()> {
             Err(error) => println!("seq={attempts} failed: {error:#}"),
         }
     }
+    print_ping_statistics(&args.target, attempts, &timings)?;
+    ensure!(!timings.is_empty(), "no TCP probes succeeded");
+    Ok(())
+}
+
+fn print_ping_statistics(target: &str, attempts: u32, timings: &[f64]) -> Result<()> {
+    let received = u32::try_from(timings.len())?;
     let loss = if attempts == 0 {
         0.0
     } else {
-        (attempts as usize - timings.len()) as f64 * 100.0 / attempts as f64
+        f64::from(attempts - received) * 100.0 / f64::from(attempts)
     };
-    println!("--- {} sshweave ping statistics ---", args.target);
-    println!(
-        "{attempts} transmitted, {} received, {loss:.1}% loss",
-        timings.len()
-    );
+    println!("--- {target} sshweave ping statistics ---");
+    println!("{attempts} transmitted, {received} received, {loss:.1}% loss");
     if !timings.is_empty() {
         println!(
             "min/avg/max = {:.3}/{:.3}/{:.3} ms",
             timings.iter().copied().fold(f64::INFINITY, f64::min),
-            timings.iter().sum::<f64>() / timings.len() as f64,
+            timings.iter().sum::<f64>() / f64::from(received),
             timings.iter().copied().fold(0.0, f64::max)
         );
     }
-    ensure!(!timings.is_empty(), "no TCP probes succeeded");
     Ok(())
 }
 
@@ -589,6 +662,7 @@ fn main() -> ExitCode {
     } else {
         "warn"
     };
+    // Logs go to stderr: stdout carries the SSH protocol in `connect`.
     if let Err(error) = tracing_subscriber::fmt()
         .with_writer(io::stderr)
         .with_env_filter(

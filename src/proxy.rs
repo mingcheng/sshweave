@@ -1,3 +1,9 @@
+//! Unauthenticated HTTP CONNECT and SOCKS5 proxy support.
+//!
+//! The destination hostname is sent to the proxy unresolved, so DNS happens on
+//! the proxy side.
+
+use crate::util;
 use anyhow::{Context, Result, bail, ensure};
 use std::net::{IpAddr, Ipv6Addr};
 use tokio::{
@@ -5,20 +11,45 @@ use tokio::{
     net::TcpStream,
 };
 
+/// Maximum accepted size of HTTP CONNECT response headers.
+const MAX_HTTP_HEADER: usize = 16 * 1024;
+
+/// SOCKS protocol version byte.
+const SOCKS_VERSION: u8 = 5;
+/// SOCKS5 "no authentication required" method.
+const SOCKS_NO_AUTH: u8 = 0;
+/// SOCKS5 CONNECT command.
+const SOCKS_CONNECT: u8 = 1;
+/// SOCKS5 address types.
+const SOCKS_ATYP_IPV4: u8 = 1;
+const SOCKS_ATYP_DOMAIN: u8 = 3;
+const SOCKS_ATYP_IPV6: u8 = 4;
+
+/// Proxy protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Protocol {
+    /// HTTP `CONNECT` tunnel.
     Http,
+    /// SOCKS5 `CONNECT` without authentication.
     Socks5,
 }
 
+/// A parsed proxy URL.
 #[derive(Clone, Debug)]
 pub struct Endpoint {
+    /// Proxy protocol.
     pub protocol: Protocol,
+    /// Proxy host name or IP address (IPv6 without brackets).
     pub host: String,
+    /// Proxy port.
     pub port: u16,
 }
 
 impl Endpoint {
+    /// Parses `http://host:port` or `socks5://host:port`.
+    ///
+    /// Credentials, paths, queries, and fragments are rejected; an explicit
+    /// port is required.
     pub fn parse(url: &str) -> Result<Self> {
         ensure!(url.len() <= 1024, "proxy URL is too long");
         let (scheme, authority) = url
@@ -69,6 +100,8 @@ impl Endpoint {
         })
     }
 
+    /// Asks the proxy, over an already connected `stream`, to open a tunnel to
+    /// `hostname:port`.
     pub async fn negotiate(&self, stream: &mut TcpStream, hostname: &str, port: u16) -> Result<()> {
         ensure!(
             !hostname.is_empty()
@@ -86,19 +119,17 @@ impl Endpoint {
     }
 }
 
+/// Performs an HTTP CONNECT handshake and accepts any 2xx response.
 async fn http_connect(stream: &mut TcpStream, hostname: &str, port: u16) -> Result<()> {
-    let address = if hostname.contains(':') {
-        format!("[{hostname}]:{port}")
-    } else {
-        format!("{hostname}:{port}")
-    };
+    let address = util::authority(hostname, port);
     stream
         .write_all(format!("CONNECT {address} HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes())
         .await?;
+    // Read byte-by-byte so no tunnel data after the headers is consumed.
     let mut header = Vec::new();
     loop {
         ensure!(
-            header.len() < 16 * 1024,
+            header.len() < MAX_HTTP_HEADER,
             "HTTP CONNECT response headers exceed 16 KiB"
         );
         header.push(
@@ -138,31 +169,32 @@ async fn http_connect(stream: &mut TcpStream, hostname: &str, port: u16) -> Resu
     Ok(())
 }
 
+/// Performs a SOCKS5 no-authentication CONNECT handshake (RFC 1928).
 async fn socks5_connect(stream: &mut TcpStream, hostname: &str, port: u16) -> Result<()> {
-    stream.write_all(&[5, 1, 0]).await?;
+    stream.write_all(&[SOCKS_VERSION, 1, SOCKS_NO_AUTH]).await?;
     let mut greeting = [0; 2];
     stream
         .read_exact(&mut greeting)
         .await
         .context("read SOCKS5 greeting")?;
     ensure!(
-        greeting == [5, 0],
+        greeting == [SOCKS_VERSION, SOCKS_NO_AUTH],
         "SOCKS5 proxy does not accept no-authentication method"
     );
-    let mut request = vec![5, 1, 0];
+    let mut request = vec![SOCKS_VERSION, SOCKS_CONNECT, 0];
     match hostname.parse::<IpAddr>() {
         Ok(IpAddr::V4(ip)) => {
-            request.push(1);
+            request.push(SOCKS_ATYP_IPV4);
             request.extend_from_slice(&ip.octets());
         }
         Ok(IpAddr::V6(ip)) => {
-            request.push(4);
+            request.push(SOCKS_ATYP_IPV6);
             request.extend_from_slice(&ip.octets());
         }
         Err(_) => {
             let length =
                 u8::try_from(hostname.len()).context("SOCKS5 hostname exceeds 255 bytes")?;
-            request.extend_from_slice(&[3, length]);
+            request.extend_from_slice(&[SOCKS_ATYP_DOMAIN, length]);
             request.extend_from_slice(hostname.as_bytes());
         }
     }
@@ -174,7 +206,7 @@ async fn socks5_connect(stream: &mut TcpStream, hostname: &str, port: u16) -> Re
         .await
         .context("read SOCKS5 CONNECT reply")?;
     ensure!(
-        reply[0] == 5 && reply[2] == 0,
+        reply[0] == SOCKS_VERSION && reply[2] == 0,
         "invalid SOCKS5 CONNECT reply"
     );
     ensure!(
@@ -182,10 +214,11 @@ async fn socks5_connect(stream: &mut TcpStream, hostname: &str, port: u16) -> Re
         "SOCKS5 CONNECT rejected with status {}",
         reply[1]
     );
+    // Discard the bound address so the stream is positioned at tunnel data.
     let length = match reply[3] {
-        1 => 4,
-        4 => 16,
-        3 => {
+        SOCKS_ATYP_IPV4 => 4,
+        SOCKS_ATYP_IPV6 => 16,
+        SOCKS_ATYP_DOMAIN => {
             let length = stream.read_u8().await?;
             ensure!(length > 0, "empty SOCKS5 bound hostname");
             usize::from(length)
