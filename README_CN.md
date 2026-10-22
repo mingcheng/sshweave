@@ -1,18 +1,19 @@
-<center>
-<img src="./sshweave.webp" width="250" alt="sshweave 标志">
-<h1>sshweave</h1>
-<p>少一些 SSH 配置负担，多一份连接从容。</p>
-<p>
+<h1 align="center">
+<img src="./sshweave.webp" width="250" alt="sshweave 标志" />
+<br/>
+sshweave
+</h1>
+<p align="center">少一些 SSH 配置负担，多一份连接从容。</p>
+<p align="center">
 <a href="README.md">English</a> | 简体中文
 </p>
-</center>
 
 sshweave 帮助你在基础设施不断扩展时，有序管理 SSH 主机与连接路径。
 集中维护共用设置，轻松访问私有网络中的主机，并继续使用熟悉的工具。
 
-sshweave 使用 Rust 编写，将 TOML 配置转换为 OpenSSH 配置，并提供
+sshweave 将 TOML 配置转换为 OpenSSH 配置，并提供
 `ProxyCommand` 传输。它不重新实现 SSH 协议：认证、主机密钥验证及会话
-仍由 OpenSSH 处理，远程主机无需安装 sshweave 代理程序。
+仍由 OpenSSH 处理。因此，远程主机无需安装 sshweave 代理程序或守护进程。
 
 ## 为什么选择 sshweave？
 
@@ -38,8 +39,9 @@ sshweave 使用 Rust 编写，将 TOML 配置转换为 OpenSSH 配置，并提�
 运行环境要求：macOS 或 Linux，并已安装 OpenSSH。使用 rsync wrapper 时，
 还需要单独安装 `rsync`。
 
-[`sshweave` crate](https://crates.io/crates/sshweave) 提供名为 `sshweave` 的命令行程序。
-通过 Cargo 安装（需要 Rust 1.88+）：
+sshweave 使用 Rust 编写，并以 Rust crate 形式发布。
+该 [crate](https://crates.io/crates/sshweave) 提供名为 `sshweave` 的命令行程序。
+通过 Cargo 安装：
 
 ```sh
 cargo install sshweave --locked
@@ -82,56 +84,7 @@ gateway_strategy = "sequential"
 使用 `chain`，并仅列出 SSH 网关名称，不包含 `direct`；
 详见[网关与故障切换](examples/README_CN.md#网关与故障切换)。
 
-### 验证并连接
-
-```sh
-sshweave config check
-sshweave topology database
-sshweave config build --write
-sshweave wrapper ssh database
-```
-
-`config check` 验证配置，不检查远程主机是否可达。`topology` 仅预览路径，
-不会建立连接或执行 hooks、命令。`config build --write` 默认写入
-`~/.config/sshweave/sshweave.conf`；不加 `--write` 时输出到 stdout。
-
-wrapper 在 OpenSSH 读取配置**之前**更新生成文件，让新匹配的主机和配置变更
-在第一次连接尝试时即可生效。此工作流无需修改 `~/.ssh/config`。
-
-wrapper 通过 `-F` 选择生成文件，而不是加载通常使用的 `~/.ssh/config`；
-请在 TOML 中配置所需的主机设置。若需合并生成配置与手写配置，或直接用于
-基于 OpenSSH 的 Git/GUI 应用，请参阅[OpenSSH Include 接入说明](examples/README_CN.md#日常接入)。
-
-使用其他 TOML 文件时，可设置 `SSHWEAVE_CONFIG`，或在子命令之前传入 `-c`，
-例如 `sshweave -c ./sshweave.toml wrapper ssh database`。
-
-## 日常使用
-
-在被包装的程序名之后传入该程序的参数与远程命令：
-
-```sh
-sshweave wrapper ssh -v database uname -a
-sshweave wrapper scp file.txt database:/tmp/
-sshweave wrapper sftp database
-sshweave wrapper rsync -az source/ database:/srv/
-```
-
-sshweave 自身的选项放在 `wrapper` 之前，例如
-`sshweave --debug wrapper ssh database`。wrapper 负责 SSH 配置与路由，
-因此会拒绝 SSH `-F`/`-J`、rsync `-e` 等冲突选项；请改为在 TOML 中配置 `gateways`。
-
-| 用途 | 命令 |
-| --- | --- |
-| 列出主机、别名和模式 | `sshweave config list` |
-| 查看解析后的主机 | `sshweave config resolve database` |
-| 以 JSON 预览路由，不建立连接 | `sshweave connect database --dry-run` |
-| 列出 OpenSSH 控制套接字（需配置 `ssh.ControlPath`） | `sshweave sockets list` |
-| 列出已实例化的目标名称，而非 SSH 主机密钥 | `sshweave cache list` |
-| 查看版本、路径和配置统计 | `sshweave info` |
-| 生成 Zsh 补全 | `sshweave completions zsh` |
-
-更多命令及 wrapper 限制见[命令参考](examples/README_CN.md#命令)；
-也可参考 [shell 别名示例](examples/README_CN.md#日常接入)，继续使用熟悉的命令名称。
+更多高级配置选项和示例，请参阅[示例指南](examples/README_CN.md)。
 
 ## 重要行为说明
 
@@ -154,6 +107,8 @@ sshweave 自身的选项放在 `wrapper` 之前，例如
 
 ## 致谢与许可
 
-作者：mingcheng <mingcheng@apache.org>。
+本项目的灵感来自 [moul/assh](https://github.com/moul/assh)，感谢原作者的启发。
 
-设计参考 [moul/assh](https://github.com/moul/assh)，采用 [MIT 许可证](LICENSE)。
+本项目由 mingcheng <mingcheng@apache.org> 维护，并采用 [MIT 许可证](LICENSE)发布。
+
+欢迎通过项目的 GitHub 仓库参与贡献或报告问题。
