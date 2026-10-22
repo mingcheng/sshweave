@@ -39,18 +39,19 @@ fn control_path_glob(host: &ResolvedHost, value: &str) -> Result<String> {
 ///
 /// Only actual Unix sockets are returned; other files are ignored.
 pub fn paths(config: &Config) -> Result<Vec<PathBuf>> {
+    let resolver = config.resolver()?;
     let cwd = std::env::current_dir()?;
     let mut patterns = BTreeSet::new();
     let mut hosts = Vec::new();
     for name in config.document.hosts.keys() {
         if resolver::is_pattern(name) {
-            hosts.push(config.resolve_inner(name)?);
+            hosts.push(resolver.entry(name)?);
         }
     }
     let mut names = config.concrete_names();
     names.extend(store::known_hosts(config)?);
-    for name in config.route_targets(names)? {
-        hosts.push(config.resolve(&name)?);
+    for name in resolver.route_targets(names)? {
+        hosts.push(resolver.resolve(&name)?);
     }
     // Synthetic catch-all host for a ControlPath configured only in [defaults].
     hosts.push(ResolvedHost {
@@ -61,7 +62,7 @@ pub fn paths(config: &Config) -> Result<Vec<PathBuf>> {
         pattern: None,
         gateways: Vec::new(),
         gateway_strategy: GatewayStrategy::default(),
-        options: config.inherit_defaults()?,
+        options: resolver.defaults().clone(),
     });
     for host in hosts {
         if let Some(value) = host.options.control_path()? {

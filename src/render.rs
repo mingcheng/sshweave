@@ -88,10 +88,9 @@ fn stanza(
 
 /// Emits the `Host *` stanza carrying `[defaults]`, excluding every name that
 /// already has its own stanza.
-fn defaults_stanza(output: &mut String, config: &Config, exclusions: &[String]) -> Result<()> {
-    let defaults = config.inherit_defaults()?;
+fn defaults_stanza(output: &mut String, defaults: &Host, exclusions: &[String]) -> Result<()> {
     writeln!(output, "\nHost * {}", exclusions.join(" "))?;
-    ssh_options(output, &defaults)?;
+    ssh_options(output, defaults)?;
     if let Some(user) = &defaults.user {
         writeln!(output, "  User {}", ssh_quote(&util::expand_env(user)?)?)?;
     }
@@ -154,13 +153,14 @@ pub fn ssh_config(
     known: &BTreeSet<String>,
     automatic_rewrite: bool,
 ) -> Result<String> {
+    let resolver = config.resolver()?;
     let mut output = HEADER.to_owned();
     writeln!(output, "# sshweave {}", env!("CARGO_PKG_VERSION"))?;
     let mut names = config.concrete_names();
     names.extend(known.iter().cloned());
-    let names = config.route_targets(names)?;
+    let names = resolver.route_targets(names)?;
     for name in &names {
-        stanza(&mut output, &config.resolve(name)?, false, &[])?;
+        stanza(&mut output, &resolver.resolve(name)?, false, &[])?;
     }
     let mut exclusions: Vec<String> = names.iter().map(|name| format!("!{name}")).collect();
     let globs: Vec<&String> = config
@@ -171,11 +171,11 @@ pub fn ssh_config(
         .filter(|pattern| is_glob(pattern))
         .collect();
     for pattern in &globs {
-        let resolved = config.resolve_inner(pattern)?;
+        let resolved = resolver.resolve_inner(pattern)?;
         stanza(&mut output, &resolved, true, &exclusions)?;
     }
     exclusions.extend(globs.iter().map(|pattern| format!("!{pattern}")));
-    defaults_stanza(&mut output, config, &exclusions)?;
+    defaults_stanza(&mut output, resolver.defaults(), &exclusions)?;
     proxy_command_stanza(&mut output, config, automatic_rewrite)?;
     Ok(output)
 }
@@ -207,6 +207,7 @@ pub fn graphviz(config: &Config) -> Result<String> {
         Ok(())
     }
 
+    let resolver = config.resolver()?;
     let mut output = String::from("digraph sshweave {\n  rankdir=LR;\n");
     for name in config.document.proxies.keys() {
         writeln!(
@@ -224,7 +225,7 @@ pub fn graphviz(config: &Config) -> Result<String> {
     }
     for (name, host) in &config.document.hosts {
         writeln!(output, "  {} [shape=ellipse];", quoted(name)?)?;
-        let resolved = config.resolve_inner(name)?;
+        let resolved = resolver.resolve_inner(name)?;
         if let Some(proxy) = &resolved.options.proxy {
             writeln!(
                 output,

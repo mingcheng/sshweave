@@ -1,5 +1,7 @@
 # Build output (including a symlink to an external cache).
 /target
+/dist/
+__pycache__/
 
 # Local editor and operating-system files.
 /.vscode/

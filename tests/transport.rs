@@ -563,6 +563,137 @@ connect_timeout=2
 
 #[cfg(unix)]
 #[tokio::test]
+async fn direct_eof_and_startup_timeout_try_the_next_route() -> Result<()> {
+    for stall in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            if stall {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            drop(socket);
+            Ok::<_, std::io::Error>(())
+        });
+        let directory = tempfile::tempdir()?;
+        let ssh = directory.path().join("ssh");
+        executable(&ssh, "#!/bin/sh\nprintf 'SSH-2.0-fallback\\r\\n'\ncat\n")?;
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "[settings]\noutput='generated.conf'\nknown_hosts='known.json'\nssh_binary='{}'\n\
+                 [hosts.db]\nhostname='127.0.0.1'\nport={port}\n\
+                 gateways=['direct','healthy']\ngateway_strategy='sequential'\nconnect_timeout=1\n\
+                 [hosts.db.hooks]\non_connect_error=[{{driver='write',message='failed:{{{{ gateway }}}}'}}]\n",
+                ssh.display()
+            ),
+        )?;
+        let started = Instant::now();
+        let output = timeout(
+            Duration::from_secs(5),
+            binary()
+                .arg("-c")
+                .arg(path)
+                .args(["connect", "--no-rewrite", "db"])
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await??;
+        if stall {
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+            assert!(started.elapsed() >= Duration::from_millis(950));
+        } else {
+            server.await??;
+        }
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"SSH-2.0-fallback\r\n");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains("failed:direct"));
+        assert!(stderr.contains(if stall {
+            "direct startup timeout"
+        } else {
+            "direct route closed before receiving destination data"
+        }));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_startup_probe_replays_every_byte_and_preserves_half_close() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        stream.write_all(b"SSH-2.0-direct\r\n\0\xff").await?;
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await?;
+        stream.write_all(&received).await?;
+        stream.shutdown().await?;
+        Ok::<_, std::io::Error>(())
+    });
+    let (_directory, path) = fixture(&format!(
+        "[hosts.db]\nhostname='127.0.0.1'\nport={port}\n\
+         gateways=['direct','unused']\ngateway_strategy='sequential'\nconnect_timeout=1\n\
+         [hosts.unused]\nproxy_command=['/nonexistent-transport']\n"
+    ))?;
+    let mut child = binary()
+        .arg("-c")
+        .arg(path)
+        .args(["connect", "--no-rewrite", "db"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().context("missing stdin")?;
+    stdin.write_all(b"payload\0\xff").await?;
+    drop(stdin);
+    let output = timeout(Duration::from_secs(5), child.wait_with_output()).await??;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"SSH-2.0-direct\r\n\0\xffpayload\0\xff");
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn wrapper_rejects_jump_overrides_before_updating_state() -> Result<()> {
+    let (_directory, path) = fixture("[hosts.db]\nhostname='127.0.0.1'\n")?;
+    let config = common::load(&path)?;
+    let baseline = binary()
+        .arg("-c")
+        .arg(&path)
+        .args(["wrapper", "ssh", "-G", "db"])
+        .output()
+        .await?;
+    assert!(baseline.status.success(), "{baseline:?}");
+    assert!(String::from_utf8(baseline.stdout)?.contains("proxycommand "));
+    let registry = fs::read(config.known_hosts()?)?;
+    let generated = fs::read(config.output()?)?;
+    for args in [
+        vec!["-J", "jump.invalid", "-G", "new-target"],
+        vec!["-Jjump.invalid", "-G", "new-target"],
+        vec!["-vJjump.invalid", "-G", "new-target"],
+        vec!["-o", "ProxyJump=jump.invalid", "-G", "new-target"],
+    ] {
+        let output = binary()
+            .arg("-c")
+            .arg(&path)
+            .args(["wrapper", "ssh"])
+            .args(args)
+            .output()
+            .await?;
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8(output.stderr)?.contains("wrapper manages SSH routing"));
+        assert_eq!(fs::read(config.known_hosts()?)?, registry);
+        assert_eq!(fs::read(config.output()?)?, generated);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn random_routes_preserve_fallback_success_and_report_exhaustion() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let ssh = dir.path().join("fake-ssh");

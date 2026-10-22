@@ -3,7 +3,8 @@
 //! For each candidate route sshweave opens a byte stream — direct TCP, an
 //! HTTP/SOCKS5 proxy, a local `proxy_command`, or `ssh -W` through a gateway —
 //! waits for the destination to send its first byte, and then relays
-//! stdin/stdout until both directions close.
+//! stdin/stdout until both directions close. Native TCP without alternative
+//! routes remains a general byte stream and does not require a server-first protocol.
 
 use crate::{
     config::{Config, Event, GatewayStrategy},
@@ -321,6 +322,32 @@ async fn proxy_connection(
     .await
 }
 
+async fn tcp_connection(host: &ResolvedHost, seconds: u64, probe: bool) -> Result<Connection> {
+    let message = if probe {
+        "direct startup timeout"
+    } else {
+        "TCP connection timeout"
+    };
+    with_timeout(seconds, message, async {
+        let mut stream = dial(&host.hostname, host.port, 0)
+            .await
+            .with_context(|| format!("connect {}:{}", host.hostname, host.port))?;
+        let first = if probe {
+            Some(
+                stream
+                    .read_u8()
+                    .await
+                    .context("direct route closed before receiving destination data")?,
+            )
+        } else {
+            None
+        };
+        let (reader, writer) = stream.into_split();
+        Ok(Connection::new(first, reader, writer, None))
+    })
+    .await
+}
+
 /// Opens one route attempt to `host` via `gateway` (`direct` or a target).
 async fn open(
     config: &Config,
@@ -328,6 +355,7 @@ async fn open(
     gateway: &str,
     stack: &[String],
     proxy_name: Option<&str>,
+    probe_direct: bool,
 ) -> Result<Connection> {
     let seconds = host
         .options
@@ -355,11 +383,7 @@ async fn open(
             command.args(args);
             return child_connection(command, seconds).await;
         }
-        let stream = dial(&host.hostname, host.port, seconds)
-            .await
-            .with_context(|| format!("connect {}:{}", host.hostname, host.port))?;
-        let (reader, writer) = stream.into_split();
-        return Ok(Connection::new(None, reader, writer, None));
+        return tcp_connection(host, seconds, probe_direct).await;
     }
     // Gateway hop: let OpenSSH reach the gateway (itself routed by sshweave),
     // then forward to the destination or run proxy_command there.
@@ -533,7 +557,9 @@ pub async fn connect(
     }
     host.options.proxy.clone_from(&proxy_name);
     let mut errors = Vec::new();
-    for gateway in attempt_routes(&host, &mut rand::rng()) {
+    let routes = attempt_routes(&host, &mut rand::rng());
+    let probe_direct = routes.len() > 1;
+    for gateway in routes {
         let mut attempt = host.clone();
         let result = async {
             prepare(&mut attempt, &gateway).await?;
@@ -543,7 +569,15 @@ pub async fn connect(
                 &json!({"host": attempt, "gateway": gateway}),
             )
             .await?;
-            open(config, &attempt, &gateway, &stack, proxy_name.as_deref()).await
+            open(
+                config,
+                &attempt,
+                &gateway,
+                &stack,
+                proxy_name.as_deref(),
+                probe_direct,
+            )
+            .await
         }
         .await;
         match result {

@@ -4,12 +4,12 @@
 //! validated eagerly at load time so later stages (resolution, rendering, and
 //! transport) can assume well-formed input.
 
-use crate::{hooks::Hook, resolver, util};
-use anyhow::{Context, Result, bail, ensure};
+use crate::{hooks::Hook, util};
+use anyhow::{Context, Result, ensure};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -505,7 +505,6 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         self.validate_proxies()?;
         self.validate_settings()?;
-        self.validate_aliases()?;
         let defaults_name = String::from("defaults");
         for (name, host) in self
             .document
@@ -522,18 +521,7 @@ impl Config {
                 );
             }
         }
-        // Check every inheritance graph even if no concrete host currently uses it.
-        for name in self
-            .document
-            .templates
-            .keys()
-            .chain(self.document.hosts.keys())
-        {
-            self.inherit(name, &mut Vec::new())?
-                .validate_gateway_strategy()?;
-        }
-        self.inherit_defaults()?.validate_gateway_strategy()?;
-        self.validate_gateway_graph()?;
+        self.resolver()?.validate_gateway_graph()?;
         self.validate_output_paths()
     }
 
@@ -562,25 +550,6 @@ impl Config {
         Ok(())
     }
 
-    /// Host names and aliases must be valid patterns, and each alias must be unique.
-    fn validate_aliases(&self) -> Result<()> {
-        let mut aliases = BTreeMap::new();
-        for (name, host) in &self.document.hosts {
-            resolver::validate_pattern(name)?;
-            for alias in &host.aliases {
-                resolver::validate_pattern(alias)?;
-                if let Some(previous) = aliases.insert(alias, name) {
-                    bail!("alias {alias:?} belongs to both {previous:?} and {name:?}");
-                }
-                ensure!(
-                    !self.document.hosts.contains_key(alias),
-                    "alias {alias:?} conflicts with a host"
-                );
-            }
-        }
-        Ok(())
-    }
-
     /// Generated files must never overwrite a source file or each other.
     fn validate_output_paths(&self) -> Result<()> {
         let output = normalized(self.output()?)?;
@@ -598,20 +567,40 @@ impl Config {
 
     /// Returns `[defaults]` with its own `inherits` applied.
     pub(crate) fn inherit_defaults(&self) -> Result<Host> {
-        let mut defaults = self.document.defaults.clone();
-        for parent in &self.document.defaults.inherits {
-            defaults.fallback(&self.inherit(parent, &mut Vec::new())?);
+        Inheritance::new(self).defaults()
+    }
+}
+
+/// Memoizes inheritance only while its source configuration is immutably borrowed.
+pub(crate) struct Inheritance<'a> {
+    config: &'a Config,
+    cache: HashMap<String, (Host, usize)>,
+}
+
+impl<'a> Inheritance<'a> {
+    pub(crate) fn new(config: &'a Config) -> Self {
+        Self {
+            config,
+            cache: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn defaults(&mut self) -> Result<Host> {
+        let mut defaults = self.config.document.defaults.clone();
+        for parent in &self.config.document.defaults.inherits {
+            defaults.fallback(&self.host(parent)?);
         }
         Ok(defaults)
     }
 
-    /// Returns the named template or host with its inheritance chain applied.
-    ///
-    /// Unprefixed names prefer templates over hosts; `stack` detects cycles.
-    pub(crate) fn inherit(&self, name: &str, stack: &mut Vec<String>) -> Result<Host> {
+    pub(crate) fn host(&mut self, name: &str) -> Result<Host> {
+        Ok(self.visit(name, &mut Vec::new())?.0)
+    }
+
+    fn visit(&mut self, name: &str, stack: &mut Vec<String>) -> Result<(Host, usize)> {
         let (kind, name) = match name.split_once(':') {
             Some((kind @ ("host" | "template"), rest)) => (kind, rest),
-            _ if self.document.templates.contains_key(name) => ("template", name),
+            _ if self.config.document.templates.contains_key(name) => ("template", name),
             _ => ("host", name),
         };
         let key = format!("{kind}:{name}");
@@ -620,18 +609,31 @@ impl Config {
             "inheritance cycle/depth limit: {} -> {key}",
             stack.join(" -> ")
         );
+        if let Some((host, depth)) = self.cache.get(&key) {
+            // A cached subtree must still fit when reached through a longer prefix.
+            ensure!(
+                stack.len() + depth <= MAX_INHERIT_DEPTH,
+                "inheritance cycle/depth limit: {} -> {key}",
+                stack.join(" -> ")
+            );
+            return Ok((host.clone(), *depth));
+        }
         let host = if kind == "template" {
-            self.document.templates.get(name)
+            self.config.document.templates.get(name)
         } else {
-            self.document.hosts.get(name)
+            self.config.document.hosts.get(name)
         }
         .with_context(|| format!("unknown inheritance parent {key}"))?;
-        stack.push(key);
+        stack.push(key.clone());
         let mut result = host.clone();
+        let mut depth = 1;
         for parent in &host.inherits {
-            result.fallback(&self.inherit(parent, stack)?);
+            let (inherited, parent_depth) = self.visit(parent, stack)?;
+            result.fallback(&inherited);
+            depth = depth.max(parent_depth + 1);
         }
         stack.pop();
-        Ok(result)
+        self.cache.insert(key, (result.clone(), depth));
+        Ok((result, depth))
     }
 }

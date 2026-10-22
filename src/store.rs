@@ -71,16 +71,68 @@ pub fn known_hosts(config: &Config) -> Result<BTreeSet<String>> {
 }
 
 /// Adds `targets` and every gateway they route through to the registry.
+///
+/// The complete generated target set is validated under the registry lock
+/// before committing, so an overflowing update leaves the old registry intact.
 pub fn remember(config: &Config, targets: &[String]) -> Result<()> {
+    let resolver = config.resolver()?;
     let path = config.known_hosts()?;
     let _guard = lock(&path.with_extension("json.lock"))?;
     let mut known = known_hosts(config)?;
     let original = known.len();
-    known.extend(config.route_targets(targets.iter().cloned())?);
+    known.extend(resolver.route_targets(targets.iter().cloned())?);
     if known.len() != original {
+        let mut all = config.concrete_names();
+        all.extend(known.iter().cloned());
+        resolver.route_targets(all).context(
+            "registry update would make the generated target set invalid; \
+             inspect `sshweave cache list` and remove stale targets with `sshweave cache remove`",
+        )?;
         atomic_write(&path, &serde_json::to_vec_pretty(&known)?)?;
     }
     Ok(())
+}
+
+/// Removes selected registry entries, or all entries when `targets` is `None`.
+///
+/// Returns the removed names. Unknown targets are errors. A dry run does not
+/// create directories or lock files, run hooks, or write any files. Only the
+/// registry is changed; the next configuration synchronization updates its output.
+pub fn forget(
+    config: &Config,
+    targets: Option<&[String]>,
+    dry_run: bool,
+) -> Result<BTreeSet<String>> {
+    if let Some(targets) = targets {
+        ensure!(!targets.is_empty(), "no cached targets selected");
+        for target in targets {
+            util::valid_target(target)?;
+        }
+    }
+    let path = config.known_hosts()?;
+    let _guard = if dry_run {
+        None
+    } else {
+        Some(lock(&path.with_extension("json.lock"))?)
+    };
+    let mut known = known_hosts(config)?;
+    let removed = match targets {
+        Some(targets) => {
+            for target in targets {
+                ensure!(
+                    known.contains(target),
+                    "target {target:?} is not registered"
+                );
+            }
+            targets.iter().cloned().collect()
+        }
+        None => known.clone(),
+    };
+    if !dry_run && !removed.is_empty() {
+        known.retain(|target| !removed.contains(target));
+        atomic_write(&path, &serde_json::to_vec_pretty(&known)?)?;
+    }
+    Ok(removed)
 }
 
 /// Regenerates the OpenSSH configuration if it changed.

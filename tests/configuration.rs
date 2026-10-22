@@ -7,7 +7,7 @@ use sshweave::{
     config::{Config, GatewayStrategy},
     render, store, util,
 };
-use std::{collections::BTreeSet, fs};
+use std::{collections::BTreeSet, fmt::Write, fs};
 use tempfile::TempDir;
 
 fn fixture(text: &str) -> Result<(TempDir, Config)> {
@@ -612,5 +612,131 @@ async fn concurrent_sync_does_not_deadlock_or_corrupt_output() -> Result<()> {
     .await?;
     assert_ne!(a?, b?);
     assert!(fs::read_to_string(config.output()?)?.starts_with(render::HEADER));
+    Ok(())
+}
+
+#[test]
+fn compiled_resolver_preserves_precedence_aliases_and_captures() -> Result<()> {
+    let (_dir, config) = fixture(
+        r#"
+[defaults]
+user = "default"
+[templates.base]
+port = 2201
+[hosts."regex:^node-(?P<id>[0-9]+)$"]
+inherits = ["base"]
+aliases = ["regex:^n(?P<id>[0-9]+)$"]
+hostname = "node-{id}.internal"
+user = "regex"
+[hosts."node-*"]
+user = "glob"
+[hosts.node-7]
+hostname = "fixed.internal"
+port = 2202
+[hosts.gateway]
+aliases = ["node-alias"]
+hostname = "gateway.internal"
+"#,
+    )?;
+    let resolver = config.resolver()?;
+    for (name, hostname, user, port, pattern) in [
+        ("node-7", "fixed.internal", "regex", 2202, "node-7"),
+        (
+            "node-8",
+            "node-8.internal",
+            "regex",
+            2201,
+            "regex:^node-(?P<id>[0-9]+)$",
+        ),
+        (
+            "n9",
+            "node-9.internal",
+            "regex",
+            2201,
+            "regex:^node-(?P<id>[0-9]+)$",
+        ),
+        ("node-alias", "gateway.internal", "glob", 22, "gateway"),
+    ] {
+        let host = resolver.resolve(name)?;
+        assert_eq!(host.hostname, hostname);
+        assert_eq!(host.user, user);
+        assert_eq!(host.port, port);
+        assert_eq!(host.pattern.as_deref(), Some(pattern));
+    }
+    assert_eq!(resolver.resolve("unknown")?.user, "default");
+    assert!(resolver.requires_materialization("n9"));
+    assert!(!resolver.requires_materialization("unknown"));
+    Ok(())
+}
+
+#[test]
+fn compiled_views_do_not_outlive_public_configuration_edits() -> Result<()> {
+    let (_dir, mut config) = fixture(
+        "[templates.base]\nuser='first'\n[hosts.db]\ninherits=['base']\naliases=['old']\n",
+    )?;
+    {
+        let resolver = config.resolver()?;
+        assert_eq!(resolver.resolve("old")?.user, "first");
+    }
+    config.document.templates["base"].user = Some("second".into());
+    config.document.hosts["db"].aliases = vec!["new".into()];
+    assert_eq!(config.resolve("new")?.user, "second");
+    assert!(config.resolve("old")?.pattern.is_none());
+    let resolver = config.resolver()?;
+    assert_eq!(resolver.resolve("db")?.user, "second");
+    Ok(())
+}
+
+#[test]
+fn cached_inheritance_subtrees_still_enforce_total_depth() -> Result<()> {
+    let mut text = String::new();
+    for index in 0..64 {
+        writeln!(text, "[templates.t{index}]")?;
+        if index > 0 {
+            writeln!(text, "inherits=['template:t{}']", index - 1)?;
+        }
+    }
+    fixture(&format!("{text}\n[hosts.db]\ninherits=['t62']\n"))?;
+    let error = fixture(&format!("{text}\n[hosts.db]\ninherits=['t63']\n")).unwrap_err();
+    assert!(error.to_string().contains("inheritance cycle/depth limit"));
+    Ok(())
+}
+
+#[test]
+fn cached_gateway_subtrees_still_enforce_total_depth() -> Result<()> {
+    let mut text = String::new();
+    for index in 0..sshweave::resolver::MAX_GATEWAY_DEPTH {
+        writeln!(text, "[hosts.g{index}]")?;
+        if index > 0 {
+            writeln!(text, "gateways=['g{}']", index - 1)?;
+        }
+    }
+    fixture(&text)?;
+    let error = fixture(&format!(
+        "{text}\n[hosts.extra]\ngateways=['g{}']\n",
+        sshweave::resolver::MAX_GATEWAY_DEPTH - 1
+    ))
+    .unwrap_err();
+    assert!(error.to_string().contains("gateway cycle/depth limit"));
+    Ok(())
+}
+
+#[test]
+fn shared_inheritance_and_gateway_graphs_preserve_repeated_edges() -> Result<()> {
+    let mut text = String::from("[templates.t0]\nuser='base'\n[hosts.g0]\n");
+    for index in 1..20 {
+        write!(
+            text,
+            "[templates.t{index}]\ninherits=['t{previous}','t{previous}']\n\
+             [hosts.g{index}]\ngateways=['g{previous}','g{previous}']\n",
+            previous = index - 1
+        )?;
+    }
+    text.push_str("[hosts.db]\ninherits=['t19']\ngateways=['g19']\n");
+    let (_dir, config) = fixture(&text)?;
+    let resolver = config.resolver()?;
+    assert_eq!(resolver.resolve("db")?.user, "base");
+    assert_eq!(resolver.resolve("g19")?.routes(), ["g18", "g18"]);
+    assert_eq!(resolver.route_targets(["db".into()])?.len(), 21);
     Ok(())
 }

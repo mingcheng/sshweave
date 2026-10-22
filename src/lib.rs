@@ -11,6 +11,19 @@
 //!
 //! [`topology`] previews routes without connecting, [`sockets`] manages
 //! OpenSSH control sockets, and [`util`] holds shared validation helpers.
+//!
+//! For repeated lookups, borrow a compiled [`resolver::Resolver`] so patterns
+//! and inherited options are reused without caching mutable configuration:
+//!
+//! ```no_run
+//! use sshweave::config::Config;
+//!
+//! let config = Config::load("sshweave.toml")?;
+//! let resolver = config.resolver()?;
+//! let database = resolver.resolve("database")?;
+//! let gateway = resolver.resolve("bastion")?;
+//! # Ok::<(), anyhow::Error>(())
+//! ```
 
 #![forbid(unsafe_code)]
 

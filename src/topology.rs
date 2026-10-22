@@ -3,7 +3,12 @@
 //! Every candidate route is expanded recursively without connecting, running
 //! commands, invoking hooks, or writing files.
 
-use crate::{config::Config, proxy, resolver::MAX_GATEWAY_DEPTH, util};
+use crate::{
+    config::Config,
+    proxy,
+    resolver::{MAX_GATEWAY_DEPTH, Resolver},
+    util,
+};
 use anyhow::{Context, Result, ensure};
 use ptree::{
     Color, PrintConfig, Style,
@@ -27,6 +32,7 @@ fn label(text: &str) -> String {
 /// Accumulates one tree branch per fully expanded route.
 struct Planner<'a> {
     config: &'a Config,
+    resolver: Resolver<'a>,
     routes: Vec<StringItem>,
     visits: usize,
     nodes: usize,
@@ -57,7 +63,7 @@ impl Planner<'_> {
             "topology expansion exceeds {MAX_NODES} nodes"
         );
         stack.push(target.into());
-        let host = self.config.resolve(target)?;
+        let host = self.resolver.resolve(target)?;
         let proxy_name = inherited_proxy.or(host.options.proxy.as_deref());
         let destination = format!(
             "{}  [SSH {}@{}]{}",
@@ -156,6 +162,7 @@ impl Planner<'_> {
 fn tree(config: &Config, target: &str) -> Result<StringItem> {
     let mut planner = Planner {
         config,
+        resolver: config.resolver()?,
         routes: Vec::new(),
         visits: 0,
         nodes: 0,

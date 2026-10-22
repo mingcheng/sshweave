@@ -2,20 +2,23 @@
 //! expressions, then layering inheritance and defaults into a [`ResolvedHost`].
 
 use crate::{
-    config::{Config, GatewayStrategy, Host},
+    config::{Config, GatewayStrategy, Host, Inheritance},
     util,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use sha1::{Digest, Sha1};
-use std::{collections::BTreeSet, fmt::Write};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt::Write,
+};
 
 /// Maximum depth of nested gateway routes (shared by validation, topology,
 /// and the runtime cycle guard).
 pub const MAX_GATEWAY_DEPTH: usize = 32;
 
 /// Maximum number of distinct targets reachable through gateway expansion.
-const MAX_ROUTE_TARGETS: usize = 4096;
+pub const MAX_ROUTE_TARGETS: usize = 4096;
 
 /// Returns whether `name` is a glob or `regex:` pattern rather than a literal.
 pub fn is_pattern(name: &str) -> bool {
@@ -29,19 +32,7 @@ fn compile_regex(expr: &str) -> Result<regex::Regex> {
 
 /// Validates a host name, alias, or pattern from the configuration.
 pub fn validate_pattern(pattern: &str) -> Result<()> {
-    ensure!(!pattern.is_empty(), "empty host pattern");
-    util::single_line(pattern)?;
-    if let Some(expr) = pattern.strip_prefix("regex:") {
-        compile_regex(expr).with_context(|| format!("invalid regular expression {pattern:?}"))?;
-    } else {
-        ensure!(
-            !pattern.starts_with('-')
-                && !pattern.contains([' ', '\t', '/', '#', '"', '\'', '%', '\\']),
-            "invalid host pattern: {pattern:?}"
-        );
-        glob::Pattern::new(pattern).with_context(|| format!("invalid glob {pattern:?}"))?;
-    }
-    Ok(())
+    CompiledPattern::new(pattern).map(|_| ())
 }
 
 /// Tests whether `name` matches a glob or `regex:` pattern.
@@ -50,6 +41,134 @@ pub fn matches(pattern: &str, name: &str) -> Result<bool> {
         Ok(compile_regex(expr)?.is_match(name))
     } else {
         Ok(glob::Pattern::new(pattern)?.matches(name))
+    }
+}
+
+#[derive(Debug)]
+enum CompiledPattern {
+    Literal,
+    Glob(glob::Pattern),
+    Regex(regex::Regex),
+}
+
+impl CompiledPattern {
+    fn new(pattern: &str) -> Result<Self> {
+        ensure!(!pattern.is_empty(), "empty host pattern");
+        util::single_line(pattern)?;
+        if let Some(expr) = pattern.strip_prefix("regex:") {
+            return Ok(Self::Regex(compile_regex(expr).with_context(|| {
+                format!("invalid regular expression {pattern:?}")
+            })?));
+        }
+        ensure!(
+            !pattern.starts_with('-')
+                && !pattern.contains([' ', '\t', '/', '#', '"', '\'', '%', '\\']),
+            "invalid host pattern: {pattern:?}"
+        );
+        let compiled =
+            glob::Pattern::new(pattern).with_context(|| format!("invalid glob {pattern:?}"))?;
+        Ok(if is_pattern(pattern) {
+            Self::Glob(compiled)
+        } else {
+            Self::Literal
+        })
+    }
+
+    fn matches(&self, literal: &str, target: &str) -> bool {
+        match self {
+            Self::Literal => literal == target,
+            Self::Glob(pattern) => pattern.matches(target),
+            Self::Regex(pattern) => pattern.is_match(target),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Rule<'a> {
+    name: &'a str,
+    pattern: CompiledPattern,
+}
+
+#[derive(Debug)]
+struct Entry<'a> {
+    name: &'a str,
+    options: Host,
+    rules: Vec<Rule<'a>>,
+}
+
+/// An immutable configuration view for repeated host and route lookups.
+///
+/// Patterns are compiled once, literal aliases are indexed, and inheritance is
+/// expanded once per entry. The source configuration remains borrowed, preventing
+/// mutation while this view is in use. Construct a new view after editing a
+/// [`Config`]; no global or cross-process cache can return stale results.
+#[derive(Debug)]
+pub struct Resolver<'a> {
+    config: &'a Config,
+    entries: Vec<Entry<'a>>,
+    aliases: HashMap<&'a str, (usize, usize)>,
+    patterns: Vec<(usize, usize)>,
+    defaults: Host,
+}
+
+impl<'a> Resolver<'a> {
+    fn new(config: &'a Config) -> Result<Self> {
+        let mut inheritance = Inheritance::new(config);
+        for name in config.document.templates.keys() {
+            inheritance
+                .host(&format!("template:{name}"))?
+                .validate_gateway_strategy()?;
+        }
+        let defaults = inheritance.defaults()?;
+        defaults.validate_gateway_strategy()?;
+        let mut entries = Vec::with_capacity(config.document.hosts.len());
+        let mut aliases = HashMap::new();
+        let mut all_aliases = HashMap::new();
+        let mut patterns = Vec::new();
+        for (index, (name, host)) in config.document.hosts.iter().enumerate() {
+            let mut rules = Vec::with_capacity(host.aliases.len() + 1);
+            for (rule_index, candidate) in std::iter::once(name).chain(&host.aliases).enumerate() {
+                let pattern = CompiledPattern::new(candidate)?;
+                if rule_index != 0 {
+                    if let Some(previous) = all_aliases.insert(candidate, name) {
+                        bail!("alias {candidate:?} belongs to both {previous:?} and {name:?}");
+                    }
+                    ensure!(
+                        !config.document.hosts.contains_key(candidate),
+                        "alias {candidate:?} conflicts with a host"
+                    );
+                    if matches!(pattern, CompiledPattern::Literal) {
+                        aliases.insert(candidate.as_str(), (index, rule_index));
+                    }
+                }
+                if !matches!(pattern, CompiledPattern::Literal) {
+                    patterns.push((index, rule_index));
+                }
+                rules.push(Rule {
+                    name: candidate,
+                    pattern,
+                });
+            }
+            let options = inheritance.host(&format!("host:{name}"))?;
+            options.validate_gateway_strategy()?;
+            entries.push(Entry {
+                name,
+                options,
+                rules,
+            });
+        }
+        Ok(Self {
+            config,
+            entries,
+            aliases,
+            patterns,
+            defaults,
+        })
+    }
+
+    /// Returns the defaults with their inheritance applied, before token expansion.
+    pub fn defaults(&self) -> &Host {
+        &self.defaults
     }
 }
 
@@ -154,10 +273,9 @@ impl ResolvedHost {
 }
 
 /// Replaces `{0}`, `{1}`, ... and `{name}` in `hostname` with regex captures.
-fn substitute_captures(hostname: &mut String, expr: &str, name: &str) -> Result<()> {
-    let re = compile_regex(expr)?;
+fn substitute_captures(hostname: &mut String, re: &regex::Regex, name: &str) {
     let Some(captures) = re.captures(name) else {
-        return Ok(());
+        return;
     };
     for (index, capture) in captures.iter().enumerate() {
         if let Some(value) = capture {
@@ -169,30 +287,25 @@ fn substitute_captures(hostname: &mut String, expr: &str, name: &str) -> Result<
             *hostname = hostname.replace(&format!("{{{key}}}"), value.as_str());
         }
     }
-    Ok(())
 }
 
-impl Config {
+impl Resolver<'_> {
     /// Returns whether `target` needs its own generated stanza: explicit
     /// chains and names matched only through patterns.
-    pub fn requires_materialization(&self, target: &str) -> Result<bool> {
+    pub fn requires_materialization(&self, target: &str) -> bool {
         if target.contains('/') {
-            return Ok(true);
+            return true;
         }
-        for (pattern, host) in &self.document.hosts {
-            for candidate in std::iter::once(pattern).chain(host.aliases.iter()) {
-                if is_pattern(candidate) && matches(candidate, target)? {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+        self.patterns.iter().any(|&(entry, rule)| {
+            let rule = &self.entries[entry].rules[rule];
+            rule.pattern.matches(rule.name, target)
+        })
     }
 
     /// Resolves a `[hosts]` key exactly as written, including pattern keys.
     pub fn entry(&self, name: &str) -> Result<ResolvedHost> {
         ensure!(
-            self.document.hosts.contains_key(name),
+            self.config.document.hosts.contains_key(name),
             "unknown host entry {name:?}"
         );
         self.resolve_inner(name)
@@ -212,39 +325,29 @@ impl Config {
         let mut parts = target.splitn(2, '/');
         let name = parts.next().context("empty target")?;
         let chain = parts.next();
-        let mut selected: Vec<(&str, &Host, &str)> = Vec::new();
-        if let Some(host) = self.document.hosts.get(name) {
-            selected.push((name, host, name));
+        let mut selected: Vec<(usize, &Rule<'_>)> = Vec::new();
+        if let Some(index) = self.config.document.hosts.get_index_of(name) {
+            selected.push((index, &self.entries[index].rules[0]));
         }
-        for (pattern, host) in &self.document.hosts {
-            if pattern == name {
+        if let Some(&(entry, rule)) = self.aliases.get(name) {
+            selected.push((entry, &self.entries[entry].rules[rule]));
+        }
+        for &(entry, rule) in &self.patterns {
+            if selected.iter().any(|(index, _)| *index == entry) {
                 continue;
             }
-            for candidate in std::iter::once(pattern).chain(host.aliases.iter()) {
-                if !is_pattern(candidate) && candidate == name {
-                    selected.push((pattern, host, candidate));
-                    break;
-                }
-            }
-        }
-        for (pattern, host) in &self.document.hosts {
-            if selected.iter().any(|(p, _, _)| *p == pattern) {
-                continue;
-            }
-            for candidate in std::iter::once(pattern).chain(host.aliases.iter()) {
-                if is_pattern(candidate) && matches(candidate, name)? {
-                    selected.push((pattern, host, candidate));
-                    break;
-                }
+            let rule = &self.entries[entry].rules[rule];
+            if rule.pattern.matches(rule.name, name) {
+                selected.push((entry, rule));
             }
         }
         let mut options = Host::default();
-        for (index, (pattern, _, candidate)) in selected.iter().enumerate() {
-            let mut incoming = self.inherit(&format!("host:{pattern}"), &mut Vec::new())?;
+        for (index, (entry, rule)) in selected.iter().enumerate() {
+            let mut incoming = self.entries[*entry].options.clone();
             if let Some(hostname) = &mut incoming.hostname
-                && let Some(expr) = candidate.strip_prefix("regex:")
+                && let CompiledPattern::Regex(pattern) = &rule.pattern
             {
-                substitute_captures(hostname, expr, name)?;
+                substitute_captures(hostname, pattern, name);
             }
             if index == 0 {
                 options = incoming;
@@ -252,8 +355,8 @@ impl Config {
                 options.fallback(&incoming);
             }
         }
-        options.fallback(&self.inherit_defaults()?);
-        let canonical = selected.first().map(|(pattern, _, _)| *pattern);
+        options.fallback(&self.defaults);
+        let canonical = selected.first().map(|(entry, _)| self.entries[*entry].name);
         // Literal aliases use the canonical hostname; patterns use the requested name.
         let default_hostname = canonical.filter(|p| !is_pattern(p)).unwrap_or(name);
         let hostname = options
@@ -308,37 +411,42 @@ impl Config {
 
     /// Rejects gateway cycles and overly deep routes for every configured host.
     pub(crate) fn validate_gateway_graph(&self) -> Result<()> {
-        fn visit(config: &Config, target: &str, stack: &mut Vec<String>) -> Result<()> {
+        fn visit(
+            resolver: &Resolver<'_>,
+            target: &str,
+            stack: &mut Vec<String>,
+            depths: &mut HashMap<String, usize>,
+        ) -> Result<usize> {
             ensure!(
                 stack.len() < MAX_GATEWAY_DEPTH && !stack.iter().any(|x| x == target),
                 "gateway cycle/depth limit: {} -> {target}",
                 stack.join(" -> ")
             );
+            if let Some(depth) = depths.get(target) {
+                ensure!(
+                    stack.len() + depth <= MAX_GATEWAY_DEPTH,
+                    "gateway cycle/depth limit: {} -> {target}",
+                    stack.join(" -> ")
+                );
+                return Ok(*depth);
+            }
             stack.push(target.into());
-            let host = config.resolve_inner(target)?;
+            let host = resolver.resolve_inner(target)?;
+            let mut depth = 1;
             for gateway in host.routes() {
                 if gateway != "direct" {
-                    visit(config, &gateway, stack)?;
+                    depth = depth.max(visit(resolver, &gateway, stack, depths)? + 1);
                 }
             }
             stack.pop();
-            Ok(())
+            depths.insert(target.into(), depth);
+            Ok(depth)
         }
-        for name in self.document.hosts.keys() {
-            visit(self, name, &mut Vec::new())?;
+        let mut depths = HashMap::new();
+        for name in self.config.document.hosts.keys() {
+            visit(self, name, &mut Vec::new(), &mut depths)?;
         }
         Ok(())
-    }
-
-    /// Literal host names and aliases (patterns excluded).
-    pub fn concrete_names(&self) -> BTreeSet<String> {
-        self.document
-            .hosts
-            .iter()
-            .flat_map(|(name, host)| std::iter::once(name).chain(host.aliases.iter()))
-            .filter(|n| !is_pattern(n))
-            .cloned()
-            .collect()
     }
 
     /// Expands targets with every gateway and chain component they can route
@@ -356,7 +464,7 @@ impl Config {
             }
             ensure!(
                 visited.len() <= MAX_ROUTE_TARGETS,
-                "too many expanded gateway targets"
+                "too many expanded gateway targets (limit {MAX_ROUTE_TARGETS})"
             );
             if let Some((first, rest)) = target.split_once('/') {
                 pending.push(first.into());
@@ -370,5 +478,47 @@ impl Config {
             );
         }
         Ok(visited)
+    }
+}
+
+impl Config {
+    /// Compiles an immutable resolver for a batch of lookups.
+    pub fn resolver(&self) -> Result<Resolver<'_>> {
+        Resolver::new(self)
+    }
+
+    /// Resolves a user-supplied target; use [`Config::resolver`] for repeated lookups.
+    pub fn resolve(&self, target: &str) -> Result<ResolvedHost> {
+        util::valid_target(target)?;
+        self.resolver()?.resolve_inner(target)
+    }
+
+    /// Resolves a `[hosts]` key exactly as written, including pattern keys.
+    pub fn entry(&self, name: &str) -> Result<ResolvedHost> {
+        self.resolver()?.entry(name)
+    }
+
+    /// Returns whether a target needs a concrete generated stanza.
+    pub fn requires_materialization(&self, target: &str) -> Result<bool> {
+        Ok(self.resolver()?.requires_materialization(target))
+    }
+
+    /// Literal host names and aliases (patterns excluded).
+    pub fn concrete_names(&self) -> BTreeSet<String> {
+        self.document
+            .hosts
+            .iter()
+            .flat_map(|(name, host)| std::iter::once(name).chain(host.aliases.iter()))
+            .filter(|name| !is_pattern(name))
+            .cloned()
+            .collect()
+    }
+
+    /// Expands targets with all reachable gateways and chain components.
+    pub fn route_targets(
+        &self,
+        targets: impl IntoIterator<Item = String>,
+    ) -> Result<BTreeSet<String>> {
+        self.resolver()?.route_targets(targets)
     }
 }
