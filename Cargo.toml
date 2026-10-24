@@ -1,6 +1,6 @@
 [package]
 name = "sshweave"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Command-line tool for composable SSH configuration and resilient gateway routing"

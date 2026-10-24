@@ -28,9 +28,39 @@ fn port_parser() -> clap::builder::RangedI64ValueParser<u16> {
     clap::value_parser!(u16).range(1..)
 }
 
+/// Default root configuration file, shared by `--config` and `--version`.
+macro_rules! default_config {
+    () => {
+        "~/.config/sshweave/sshweave.toml"
+    };
+}
+
+/// Detailed build report for `--version`; `-V` keeps the short form for scripts.
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\ncommit:   ",
+    env!("SSHWEAVE_BUILD_COMMIT"),
+    " (",
+    env!("SSHWEAVE_BUILD_DATE"),
+    ")\ntarget:   ",
+    env!("SSHWEAVE_BUILD_TARGET"),
+    " (",
+    env!("SSHWEAVE_BUILD_PROFILE"),
+    ")\ncompiler: ",
+    env!("SSHWEAVE_BUILD_RUSTC"),
+    "\nconfig:   ",
+    default_config!(),
+    " (override with -c or SSHWEAVE_CONFIG)",
+    "\nlicense:  ",
+    env!("CARGO_PKG_LICENSE"),
+    "\nhomepage: ",
+    env!("CARGO_PKG_HOMEPAGE"),
+);
+
 #[derive(Parser, Debug)]
 #[command(
     version,
+    long_version = LONG_VERSION,
     about = "Composable SSH configuration and resilient gateway routing"
 )]
 struct Cli {
@@ -39,7 +69,7 @@ struct Cli {
         long,
         short = 'c',
         env = "SSHWEAVE_CONFIG",
-        default_value = "~/.config/sshweave/sshweave.toml"
+        default_value = default_config!()
     )]
     config: PathBuf,
     /// Log informational messages.
@@ -166,6 +196,12 @@ enum CacheCommand {
     },
     /// Clear the registry; never touches OpenSSH's known_hosts.
     Clear {
+        /// Preview removals without creating or changing any files.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove targets that no longer need their own generated stanza.
+    Prune {
         /// Preview removals without creating or changing any files.
         #[arg(long)]
         dry_run: bool,
@@ -392,14 +428,16 @@ struct ExplainLayer<'a> {
 }
 
 fn explain(config: &Config, target: &str) -> Result<()> {
-    let resolved = config.resolve(target)?;
+    let resolver = config.resolver()?;
+    let resolved = resolver.resolve(target)?;
+    let matched = resolver.matched_entries(target);
     let mut layers = Vec::new();
     let mut stack = Vec::new();
     let mut seen = BTreeSet::new();
-    if let Some(pattern) = &resolved.pattern {
+    for entry in &matched {
         explain_walk(
             config,
-            &format!("host:{pattern}"),
+            &format!("host:{entry}"),
             &mut layers,
             &mut stack,
             &mut seen,
@@ -407,9 +445,11 @@ fn explain(config: &Config, target: &str) -> Result<()> {
     }
     explain_defaults(config, &mut layers, &mut stack, &mut seen)?;
     println!("{} -> {}", resolved.name, resolved.prototype());
-    match &resolved.pattern {
-        Some(pattern) => println!("matched: host {pattern}"),
-        None => println!("matched: no host entry"),
+    if matched.is_empty() {
+        println!("matched: no host entry");
+    }
+    for entry in &matched {
+        println!("matched: host {entry}");
     }
     if target.contains('/') {
         println!(
@@ -422,6 +462,13 @@ fn explain(config: &Config, target: &str) -> Result<()> {
         println!("gateway_strategy: {}", resolved.gateway_strategy.as_str());
     }
     report_field("hostname", &layers, |host| host.hostname.clone());
+    if layers
+        .iter()
+        .find_map(|layer| layer.host.hostname.as_deref())
+        .is_some_and(|hostname| hostname != resolved.hostname)
+    {
+        println!("  resolved as {}", resolved.hostname);
+    }
     report_field("user", &layers, |host| host.user.clone());
     report_field("port", &layers, |host| {
         host.port.map(|port| port.to_string())
@@ -572,6 +619,11 @@ fn info(config: &Config) -> Result<()> {
     let output = config.output()?;
     print_json(&json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "commit": env!("SSHWEAVE_BUILD_COMMIT"),
+        "commit_date": env!("SSHWEAVE_BUILD_DATE"),
+        "target": env!("SSHWEAVE_BUILD_TARGET"),
+        "profile": env!("SSHWEAVE_BUILD_PROFILE"),
+        "compiler": env!("SSHWEAVE_BUILD_RUSTC"),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "executable": std::env::current_exe()?,
@@ -651,6 +703,11 @@ async fn doctor(config: &Config) -> Result<i32> {
                     "proxycommand: generated file does not reference {}",
                     binary.display()
                 );
+                if config.document.settings.binary.is_none() {
+                    println!(
+                        "proxycommand: settings.binary is unset, so each sshweave executable rewrites the file with its own path. Set settings.binary to one stable path."
+                    );
+                }
             }
         }
         Ok(_) => {
@@ -775,18 +832,21 @@ async fn connect(
     // Validate the target before it can be written to the registry.
     let resolver = config.resolver()?;
     resolver.resolve(target)?;
-    if !no_rewrite && config.document.settings.automatic_rewrite {
+    // A nested hop is started by an outer sshweave process that has already
+    // registered the whole route and synchronized the generated file.
+    let nested = std::env::var_os(runtime::ROUTE_STACK_ENV).is_some();
+    if !no_rewrite && !nested && config.document.settings.automatic_rewrite {
         if resolver.requires_materialization(target) {
-            store::remember(config, &[target.to_owned()])?;
+            store::remember_with(&resolver, &[target.to_owned()])?;
         }
         // OpenSSH has already parsed the old file, so a changed file cannot
         // take effect for this connection.
         ensure!(
-            !store::sync(config, true).await?,
+            !store::sync_with(&resolver, true).await?,
             "configuration updated after OpenSSH read it; retry SSH, or use `sshweave wrapper ssh` to apply changes before connecting"
         );
     }
-    runtime::connect(config, target, port, user).await
+    runtime::connect_with(&resolver, target, port, user).await
 }
 
 async fn sockets_command(config: &Config, command: SocketCommand) -> Result<()> {
@@ -804,8 +864,8 @@ async fn sockets_command(config: &Config, command: SocketCommand) -> Result<()> 
             for target in &targets {
                 resolver.resolve(target)?;
             }
-            store::remember(config, &targets)?;
-            store::sync(config, config.document.settings.automatic_rewrite).await?;
+            store::remember_with(&resolver, &targets)?;
+            store::sync_with(&resolver, config.document.settings.automatic_rewrite).await?;
             for target in targets {
                 let host = resolver.resolve(&target)?;
                 runtime::prepare_control_path(&host)?;
@@ -839,9 +899,18 @@ fn cache_command(config: &Config, command: CacheCommand) -> Result<()> {
         }
         CacheCommand::Remove { targets, dry_run } => (Some(targets), dry_run),
         CacheCommand::Clear { dry_run } => (None, dry_run),
+        CacheCommand::Prune { dry_run } => {
+            return report_removed(&store::prune(config, dry_run)?, dry_run);
+        }
     };
-    let removed = store::forget(config, targets.as_deref(), dry_run)?;
-    for target in &removed {
+    report_removed(
+        &store::forget(config, targets.as_deref(), dry_run)?,
+        dry_run,
+    )
+}
+
+fn report_removed(removed: &BTreeSet<String>, dry_run: bool) -> Result<()> {
+    for target in removed {
         println!("{target}");
     }
     eprintln!(
@@ -890,7 +959,7 @@ async fn ping(config: &Config, args: PingArgs) -> Result<()> {
         }
         let start = Instant::now();
         let connection = tokio::select! {
-            result = runtime::dial(&probe.hostname, probe.port, args.timeout) => result,
+            result = runtime::dial_with(&probe.hostname, probe.port, args.timeout, &probe.dial) => result,
             result = tokio::signal::ctrl_c() => { result?; break; }
         };
         attempts += 1;
@@ -977,6 +1046,27 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_version_reports_build_details_and_short_version_stays_plain() {
+        let command = Cli::command();
+        assert_eq!(
+            command.render_version(),
+            concat!("sshweave ", env!("CARGO_PKG_VERSION"), "\n")
+        );
+        let long = command.render_long_version();
+        assert!(long.starts_with(concat!("sshweave ", env!("CARGO_PKG_VERSION"), "\n")));
+        for label in [
+            "commit:",
+            "target:",
+            "compiler:",
+            "config:",
+            "license:",
+            "homepage:",
+        ] {
+            assert!(long.contains(label), "missing {label} in {long}");
+        }
+    }
 
     #[test]
     fn wrapper_cli_preserves_ssh_flags_and_remote_arguments() -> Result<()> {

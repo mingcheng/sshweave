@@ -7,9 +7,9 @@
 //! routes remains a general byte stream and does not require a server-first protocol.
 
 use crate::{
-    config::{Config, Event, GatewayStrategy},
+    config::{Config, Event, GatewayStrategy, Host},
     hooks, proxy,
-    resolver::{MAX_GATEWAY_DEPTH, ResolvedHost},
+    resolver::{MAX_GATEWAY_DEPTH, ResolvedHost, Resolver},
     util,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -17,6 +17,8 @@ use rand::{Rng, seq::SliceRandom};
 use serde::Serialize;
 use serde_json::json;
 use std::{
+    collections::VecDeque,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     process::Stdio,
     sync::{
@@ -27,21 +29,27 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpSocket, TcpStream},
     process::{Child, Command},
+    signal::unix::{SignalKind, signal},
     sync::Mutex,
-    time::{Instant, sleep_until, timeout},
+    task::JoinSet,
+    time::{Instant, sleep, sleep_until, timeout},
 };
 
 /// Timeout in seconds used when `connect_timeout` is not configured.
 const DEFAULT_CONNECT_TIMEOUT: u64 = 10;
+
+/// Delay before racing the next resolved address while earlier attempts are
+/// still pending (RFC 8305 "Connection Attempt Delay").
+const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 /// Relay buffer size without a rate limit.
 const BUFFER_SIZE: usize = 16 * 1024;
 
 /// Environment variable carrying the JSON list of targets on the current route,
 /// used to detect gateway cycles across nested sshweave processes.
-const ROUTE_STACK_ENV: &str = "SSHWEAVE_ROUTE_STACK";
+pub const ROUTE_STACK_ENV: &str = "SSHWEAVE_ROUTE_STACK";
 
 /// Environment variable forcing the proxy of the outermost hop in nested processes.
 const ROUTE_PROXY_ENV: &str = "SSHWEAVE_ROUTE_PROXY";
@@ -193,11 +201,181 @@ where
     }
 }
 
+/// Address family restriction from OpenSSH's `AddressFamily` option.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AddressFamily {
+    /// IPv4 or IPv6 (`any`, the default).
+    #[default]
+    Any,
+    /// IPv4 only (`inet`).
+    Inet,
+    /// IPv6 only (`inet6`).
+    Inet6,
+}
+
+impl AddressFamily {
+    /// Parses an OpenSSH `AddressFamily` value.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "any" => Ok(Self::Any),
+            "inet" => Ok(Self::Inet),
+            "inet6" => Ok(Self::Inet6),
+            _ => bail!("AddressFamily must be any, inet, or inet6"),
+        }
+    }
+
+    fn allows(self, address: &SocketAddr) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Inet => address.is_ipv4(),
+            Self::Inet6 => address.is_ipv6(),
+        }
+    }
+}
+
+/// Local socket preferences for sshweave's own TCP connections, taken from the
+/// OpenSSH `AddressFamily` and `BindAddress` options of the dialed host.
+#[derive(Clone, Debug, Default)]
+pub struct DialOptions {
+    /// Allowed destination address family.
+    pub family: AddressFamily,
+    /// Local address or hostname to bind before connecting.
+    pub bind: Option<String>,
+}
+
+impl DialOptions {
+    /// Reads `AddressFamily` and `BindAddress` from a host's SSH options.
+    pub fn from_host(host: &Host) -> Result<Self> {
+        fn single(host: &Host, key: &str) -> Result<Option<String>> {
+            let Some(value) = host.ssh_option(key) else {
+                return Ok(None);
+            };
+            let mut lines = value.lines();
+            ensure!(lines.len() == 1, "{key} requires one value");
+            let value = util::expand_env(&lines.remove(0))?;
+            let mut words = shell_words::split(&value).with_context(|| format!("parse {key}"))?;
+            ensure!(words.len() == 1, "{key} requires one value");
+            Ok(Some(words.remove(0)))
+        }
+        Ok(Self {
+            family: single(host, "AddressFamily")?
+                .map(|value| AddressFamily::parse(&value))
+                .transpose()?
+                .unwrap_or_default(),
+            bind: single(host, "BindAddress")?,
+        })
+    }
+
+    async fn bind_addresses(&self) -> Result<Vec<IpAddr>> {
+        let Some(bind) = &self.bind else {
+            return Ok(Vec::new());
+        };
+        if let Ok(address) = bind.parse::<IpAddr>() {
+            return Ok(vec![address]);
+        }
+        let addresses: Vec<IpAddr> = tokio::net::lookup_host((bind.as_str(), 0))
+            .await
+            .with_context(|| format!("resolve BindAddress {bind}"))?
+            .map(|address| address.ip())
+            .collect();
+        ensure!(!addresses.is_empty(), "BindAddress {bind} has no addresses");
+        Ok(addresses)
+    }
+}
+
+/// Orders addresses by alternating families, starting with the resolver's
+/// first preference (RFC 8305 section 4).
+fn interleave(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let first_v6 = addresses.first().is_some_and(SocketAddr::is_ipv6);
+    let (v6, v4): (VecDeque<_>, VecDeque<_>) = addresses.into_iter().partition(SocketAddr::is_ipv6);
+    let (mut first, mut second) = if first_v6 { (v6, v4) } else { (v4, v6) };
+    let mut ordered = Vec::with_capacity(first.len() + second.len());
+    while !first.is_empty() || !second.is_empty() {
+        ordered.extend(first.pop_front());
+        ordered.extend(second.pop_front());
+    }
+    ordered
+}
+
+async fn connect_address(address: SocketAddr, binds: Arc<Vec<IpAddr>>) -> Result<TcpStream> {
+    let socket = if address.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    if !binds.is_empty() {
+        let local = binds
+            .iter()
+            .find(|ip| ip.is_ipv4() == address.is_ipv4())
+            .with_context(|| format!("BindAddress has no address for {address}"))?;
+        socket
+            .bind(SocketAddr::new(*local, 0))
+            .with_context(|| format!("bind {local}"))?;
+    }
+    Ok(socket.connect(address).await?)
+}
+
+/// Connects to the first reachable resolved address. A new attempt starts
+/// whenever the previous one fails or after [`CONNECTION_ATTEMPT_DELAY`], so
+/// one unreachable address family cannot consume the whole timeout.
+async fn connect_any(hostname: &str, port: u16, options: &DialOptions) -> Result<TcpStream> {
+    let binds = Arc::new(options.bind_addresses().await?);
+    let resolved: Vec<SocketAddr> = tokio::net::lookup_host((hostname, port))
+        .await
+        .with_context(|| format!("resolve {hostname}"))?
+        .filter(|address| options.family.allows(address))
+        .collect();
+    ensure!(
+        !resolved.is_empty(),
+        "{hostname} has no address allowed by AddressFamily"
+    );
+    let mut pending = interleave(resolved).into_iter();
+    let mut attempts = JoinSet::new();
+    let mut last_error = None;
+    let mut next = pending.next();
+    loop {
+        if let Some(address) = next.take() {
+            attempts.spawn(connect_address(address, binds.clone()));
+        }
+        let more = pending.len() > 0;
+        tokio::select! {
+            joined = attempts.join_next() => match joined {
+                Some(result) => match result.context("connection attempt task")? {
+                    // Dropping the JoinSet aborts the remaining attempts.
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => {
+                        last_error = Some(error);
+                        next = pending.next();
+                        if next.is_none() && attempts.is_empty() {
+                            break;
+                        }
+                    }
+                },
+                None => break,
+            },
+            () = sleep(CONNECTION_ATTEMPT_DELAY), if more => next = pending.next(),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("no addresses for {hostname}")))
+}
+
 /// Opens a TCP connection with `TCP_NODELAY`; `seconds == 0` disables the timeout.
 pub async fn dial(hostname: &str, port: u16, seconds: u64) -> Result<TcpStream> {
-    let stream = with_timeout(seconds, "TCP connection timeout", async {
-        Ok(TcpStream::connect((hostname, port)).await?)
-    })
+    dial_with(hostname, port, seconds, &DialOptions::default()).await
+}
+
+/// Like [`dial`], honoring an address family restriction and local bind address.
+pub async fn dial_with(
+    hostname: &str,
+    port: u16,
+    seconds: u64,
+    options: &DialOptions,
+) -> Result<TcpStream> {
+    let stream = with_timeout(
+        seconds,
+        "TCP connection timeout",
+        connect_any(hostname, port, options),
+    )
     .await?;
     stream.set_nodelay(true)?;
     Ok(stream)
@@ -329,7 +507,8 @@ async fn tcp_connection(host: &ResolvedHost, seconds: u64, probe: bool) -> Resul
         "TCP connection timeout"
     };
     with_timeout(seconds, message, async {
-        let mut stream = dial(&host.hostname, host.port, 0)
+        let options = DialOptions::from_host(&host.options)?;
+        let mut stream = dial_with(&host.hostname, host.port, 0, &options)
             .await
             .with_context(|| format!("connect {}:{}", host.hostname, host.port))?;
         let first = if probe {
@@ -432,6 +611,10 @@ async fn relay(connection: &mut Connection, host: &ResolvedHost) -> Result<Stats
         connected_at: now()?,
         ..Stats::default()
     };
+    // Register before on_connect so a signal arriving during the hook is kept.
+    let mut hangup = signal(SignalKind::hangup())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
     hooks::invoke(
         &host.options,
         Event::OnConnect,
@@ -463,8 +646,19 @@ async fn relay(connection: &mut Connection, host: &ResolvedHost) -> Result<Stats
             }
         }
         Ok::<_, anyhow::Error>(())
-    }
-    .await;
+    };
+    // OpenSSH sends SIGHUP to its ProxyCommand when it exits, which is a normal
+    // end of the session. Handle termination signals so cleanup and
+    // on_disconnect hooks still run instead of the process being killed.
+    let transfer = tokio::select! {
+        result = transfer => result,
+        _ = hangup.recv() => {
+            tracing::debug!("SIGHUP received; closing transport");
+            Ok(())
+        }
+        _ = terminate.recv() => Err(anyhow!("terminated by SIGTERM")),
+        _ = interrupt.recv() => Err(anyhow!("interrupted by SIGINT")),
+    };
     let cleanup = async {
         if let Some(child) = &mut connection.child {
             // Closing the read side or stdin may leave ssh alive; reap it explicitly.
@@ -527,7 +721,18 @@ pub async fn connect(
     port: Option<u16>,
     user: Option<&str>,
 ) -> Result<()> {
-    let mut host = config.resolve(target)?;
+    connect_with(&config.resolver()?, target, port, user).await
+}
+
+/// Like [`connect`], reusing an already compiled [`Resolver`].
+pub async fn connect_with(
+    resolver: &Resolver<'_>,
+    target: &str,
+    port: Option<u16>,
+    user: Option<&str>,
+) -> Result<()> {
+    let config = resolver.config();
+    let mut host = resolver.resolve(target)?;
     if let Some(port) = port {
         ensure!(port > 0, "port must be positive");
         host.port = port;
@@ -587,12 +792,16 @@ pub async fn connect(
                 return Ok(());
             }
             Err(error) => {
-                hooks::invoke(
+                // A failing notification must not prevent the remaining routes.
+                if let Err(hook_error) = hooks::invoke(
                     &attempt.options,
                     Event::OnConnectError,
                     &json!({"host": attempt, "gateway": gateway, "error": format!("{error:#}")}),
                 )
-                .await?;
+                .await
+                {
+                    tracing::error!(%gateway, error = %format!("{hook_error:#}"), "connect error hook failed");
+                }
                 tracing::warn!(%gateway, error = %format!("{error:#}"), "route failed");
                 errors.push(format!("{gateway}: {error:#}"));
             }
@@ -610,6 +819,28 @@ mod tests {
     use crate::config::Host;
     use rand::{SeedableRng, rngs::StdRng};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn interleave_alternates_address_families_from_first_preference() {
+        let parse = |items: &[&str]| -> Vec<SocketAddr> {
+            items.iter().map(|item| item.parse().unwrap()).collect()
+        };
+        assert_eq!(
+            interleave(parse(&[
+                "[::1]:22",
+                "[::2]:22",
+                "10.0.0.1:22",
+                "10.0.0.2:22"
+            ])),
+            parse(&["[::1]:22", "10.0.0.1:22", "[::2]:22", "10.0.0.2:22"])
+        );
+        assert_eq!(
+            interleave(parse(&["10.0.0.1:22", "[::1]:22", "[::2]:22"])),
+            parse(&["10.0.0.1:22", "[::1]:22", "[::2]:22"])
+        );
+        assert!(AddressFamily::parse("INET6").is_ok_and(|f| f == AddressFamily::Inet6));
+        assert!(AddressFamily::parse("ipv4").is_err());
+    }
 
     #[test]
     fn random_routes_shuffle_all_candidates_without_losing_fallbacks() {

@@ -74,7 +74,8 @@ and [sample configuration](../examples/sshweave.toml). Chinese counterparts are
   `on_disconnect` follows the proxy stream, not each multiplexed SSH session.
   Runtime transport changes must preserve the destination-first-byte probe and
   bidirectional streaming with half-close support.
-- Preserve nested-route safeguards: `SSHWEAVE_ROUTE_STACK` detects cycles,
+- Preserve nested-route safeguards: `SSHWEAVE_ROUTE_STACK` detects cycles (and
+  marks nested hops, which skip registry and configuration rewrites),
   `SSHWEAVE_ROUTE_PROXY` forces the outermost proxy, and gateway recursion is
   bounded at 32. A transport cannot combine a proxy with `proxy_command`.
   Current HTTP/SOCKS5 proxy support is unauthenticated.

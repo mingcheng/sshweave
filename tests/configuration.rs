@@ -740,3 +740,97 @@ fn shared_inheritance_and_gateway_graphs_preserve_repeated_edges() -> Result<()>
     assert_eq!(resolver.route_targets(["db".into()])?.len(), 21);
     Ok(())
 }
+
+#[test]
+fn same_name_entries_keep_aliases_and_inherits_from_earlier_files() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("fragment.toml"),
+        r#"
+[defaults]
+inherits = ["base"]
+[templates.base]
+port = 2200
+[templates.other]
+port = 2300
+[hosts.db]
+hostname = "10.0.0.5"
+aliases = ["database"]
+inherits = ["base"]
+[hosts.web]
+aliases = ["www"]
+inherits = ["base"]
+"#,
+    )?;
+    fs::write(
+        dir.path().join("config.toml"),
+        r#"
+includes = ["fragment.toml"]
+[settings]
+output = "generated.conf"
+known_hosts = "known.json"
+[defaults]
+user = "ops"
+[hosts.db]
+user = "admin"
+[hosts.web]
+aliases = ["site"]
+inherits = ["other"]
+"#,
+    )?;
+    let config = common::load(dir.path().join("config.toml"))?;
+    let db = config.resolve("database")?;
+    assert_eq!(
+        (db.hostname.as_str(), db.user.as_str(), db.port),
+        ("10.0.0.5", "admin", 2200)
+    );
+    assert_eq!(config.document.defaults.inherits, ["base"]);
+    assert_eq!(config.resolve("unlisted")?.port, 2200);
+    // Non-empty lists in the later file replace the earlier ones.
+    assert_eq!(config.resolve("site")?.port, 2300);
+    assert_eq!(config.resolve("www")?.hostname, "www");
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_reuses_current_output_and_repairs_modified_output() -> Result<()> {
+    let (_dir, config) = fixture("[hosts.db]\nhostname = '10.0.0.1'\n")?;
+    assert!(store::sync(&config, true).await?);
+    let output = config.output()?;
+    let generated = fs::read_to_string(&output)?;
+    let inputs = render::input_digest(&config, &store::known_hosts(&config)?, true)?;
+    assert!(render::is_current(&generated, &inputs));
+    assert!(!render::is_current(&generated, "0"));
+    assert!(!store::sync(&config, true).await?);
+    // The no-rewrite mode is a different input.
+    assert!(!render::is_current(
+        &generated,
+        &render::input_digest(&config, &BTreeSet::new(), false)?
+    ));
+
+    let tampered = generated.replace("10.0.0.1", "10.0.0.9");
+    fs::write(&output, &tampered)?;
+    assert!(!render::is_current(&tampered, &inputs));
+    assert!(store::sync(&config, true).await?);
+    assert_eq!(fs::read_to_string(&output)?, generated);
+
+    store::remember(&config, &["db/bastion".into()])?;
+    assert!(store::sync(&config, true).await?);
+    assert!(fs::read_to_string(&output)?.contains("Host db/bastion"));
+    Ok(())
+}
+
+#[test]
+fn address_family_and_bind_address_are_validated() -> Result<()> {
+    assert!(
+        fixture("[hosts.db.ssh]\nAddressFamily = 'inet6'\nBindAddress = '127.0.0.1'\n").is_ok()
+    );
+    for text in [
+        "[hosts.db.ssh]\nAddressFamily = 'ipv4'\n",
+        "[defaults.ssh]\nAddressFamily = ['inet', 'inet6']\n",
+        "[hosts.db.ssh]\nBindAddress = '127.0.0.1 ::1'\n",
+    ] {
+        assert!(fixture(text).is_err(), "{text}");
+    }
+    Ok(())
+}

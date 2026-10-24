@@ -3,7 +3,9 @@
 
 use crate::{
     config::{Config, Event},
-    hooks, render, util,
+    hooks, render,
+    resolver::Resolver,
+    util,
 };
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
@@ -75,12 +77,23 @@ pub fn known_hosts(config: &Config) -> Result<BTreeSet<String>> {
 /// The complete generated target set is validated under the registry lock
 /// before committing, so an overflowing update leaves the old registry intact.
 pub fn remember(config: &Config, targets: &[String]) -> Result<()> {
-    let resolver = config.resolver()?;
+    remember_with(&config.resolver()?, targets)
+}
+
+/// Like [`remember`], reusing an already compiled [`Resolver`].
+pub fn remember_with(resolver: &Resolver<'_>, targets: &[String]) -> Result<()> {
+    let config = resolver.config();
+    let additions = resolver.route_targets(targets.iter().cloned())?;
+    // The registry is replaced atomically, so an unlocked read is a consistent
+    // snapshot; skip locking when nothing would be added.
+    if additions.is_subset(&known_hosts(config)?) {
+        return Ok(());
+    }
     let path = config.known_hosts()?;
     let _guard = lock(&path.with_extension("json.lock"))?;
     let mut known = known_hosts(config)?;
     let original = known.len();
-    known.extend(resolver.route_targets(targets.iter().cloned())?);
+    known.extend(additions);
     if known.len() != original {
         let mut all = config.concrete_names();
         all.extend(known.iter().cloned());
@@ -91,6 +104,35 @@ pub fn remember(config: &Config, targets: &[String]) -> Result<()> {
         atomic_write(&path, &serde_json::to_vec_pretty(&known)?)?;
     }
     Ok(())
+}
+
+/// Removes registry entries that no longer need a generated stanza.
+///
+/// An entry is kept when it is an explicit chain or matches only through a
+/// pattern, or when such an entry routes through it. Everything else is
+/// already covered by configured hosts or the generated `Host *` rules.
+/// Returns the removed names; a dry run changes no files.
+pub fn prune(config: &Config, dry_run: bool) -> Result<BTreeSet<String>> {
+    let resolver = config.resolver()?;
+    let path = config.known_hosts()?;
+    let _guard = if dry_run {
+        None
+    } else {
+        Some(lock(&path.with_extension("json.lock"))?)
+    };
+    let mut known = known_hosts(config)?;
+    let required = resolver.route_targets(
+        known
+            .iter()
+            .filter(|target| resolver.requires_materialization(target))
+            .cloned(),
+    )?;
+    let removed: BTreeSet<String> = known.difference(&required).cloned().collect();
+    if !dry_run && !removed.is_empty() {
+        known.retain(|target| !removed.contains(target));
+        atomic_write(&path, &serde_json::to_vec_pretty(&known)?)?;
+    }
+    Ok(removed)
 }
 
 /// Removes selected registry entries, or all entries when `targets` is `None`.
@@ -141,10 +183,23 @@ pub fn forget(
 /// [`render::HEADER`] are never overwritten. Config-write hooks only run when
 /// the content actually changes.
 pub async fn sync(config: &Config, automatic_rewrite: bool) -> Result<bool> {
+    sync_with(&config.resolver()?, automatic_rewrite).await
+}
+
+/// Like [`sync`], reusing an already compiled [`Resolver`].
+///
+/// A managed file whose recorded input fingerprint matches and whose content
+/// is unmodified is accepted without locking or rendering.
+pub async fn sync_with(resolver: &Resolver<'_>, automatic_rewrite: bool) -> Result<bool> {
+    let config = resolver.config();
     let output = config.output()?;
+    let inputs = render::input_digest(config, &known_hosts(config)?, automatic_rewrite)?;
+    if fs::read_to_string(&output).is_ok_and(|current| render::is_current(&current, &inputs)) {
+        return Ok(false);
+    }
     let lock_path = output.with_extension("conf.lock");
     let _guard = tokio::task::spawn_blocking(move || lock(&lock_path)).await??;
-    let generated = render::ssh_config(config, &known_hosts(config)?, automatic_rewrite)?;
+    let generated = render::ssh_config_with(resolver, &known_hosts(config)?, automatic_rewrite)?;
     match fs::read_to_string(&output) {
         Ok(current) => {
             ensure!(

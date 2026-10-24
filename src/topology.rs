@@ -7,7 +7,7 @@ use crate::{
     config::{Config, GatewayStrategy},
     proxy,
     resolver::{MAX_GATEWAY_DEPTH, Resolver},
-    util,
+    runtime, util,
 };
 use anyhow::{Context, Result, ensure};
 use ptree::{
@@ -228,6 +228,8 @@ pub struct TcpProbe {
     pub honor_port_override: bool,
     /// Short description of the hop, for the probe banner.
     pub via: String,
+    /// `AddressFamily`/`BindAddress` of the probed host (defaults for proxies).
+    pub dial: runtime::DialOptions,
 }
 
 /// Resolves the first TCP hop of `target`.
@@ -282,6 +284,7 @@ pub fn tcp_probe(config: &Config, target: &str) -> Result<TcpProbe> {
                     prepare_host: None,
                     honor_port_override: false,
                     via: format!("proxy {name} ({}){note}", definition.url),
+                    dial: runtime::DialOptions::default(),
                 });
             }
             let direct = stack.len() == 1;
@@ -296,6 +299,7 @@ pub fn tcp_probe(config: &Config, target: &str) -> Result<TcpProbe> {
                     if direct { "direct" } else { "gateway" },
                     host.name
                 ),
+                dial: runtime::DialOptions::from_host(&host.options)?,
             })
         })();
         stack.pop();

@@ -704,7 +704,8 @@ async fn wrapper_rejects_jump_overrides_before_updating_state() -> Result<()> {
         .await?;
     assert!(baseline.status.success(), "{baseline:?}");
     assert!(String::from_utf8(baseline.stdout)?.contains("proxycommand "));
-    let registry = fs::read(config.known_hosts()?)?;
+    // Configured hosts need no registry entry, so the registry may not exist.
+    let registry = fs::read(config.known_hosts()?).ok();
     let generated = fs::read(config.output()?)?;
     for args in [
         vec!["-J", "jump.invalid", "-G", "new-target"],
@@ -722,7 +723,7 @@ async fn wrapper_rejects_jump_overrides_before_updating_state() -> Result<()> {
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
         assert!(String::from_utf8(output.stderr)?.contains("wrapper manages SSH routing"));
-        assert_eq!(fs::read(config.known_hosts()?)?, registry);
+        assert_eq!(fs::read(config.known_hosts()?).ok(), registry);
         assert_eq!(fs::read(config.output()?)?, generated);
     }
     Ok(())
@@ -1611,5 +1612,266 @@ async fn doctor_and_search_report_integration_and_resolved_names() -> Result<()>
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hangup_from_openssh_ends_relay_and_runs_disconnect_hooks() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await?;
+        socket.write_all(b"banner").await?;
+        let mut data = Vec::new();
+        socket.read_to_end(&mut data).await?;
+        Ok::<_, std::io::Error>(())
+    });
+    let (_dir, path) = fixture(&format!(
+        r#"
+[hosts.test]
+hostname="127.0.0.1"
+port={port}
+[hosts.test.hooks]
+on_disconnect=[{{driver="write", message="disconnected error={{{{ error }}}} received={{{{ stats.received_bytes }}}}"}}]
+"#
+    ))?;
+    let mut child = binary()
+        .arg("-c")
+        .arg(&path)
+        .args(["connect", "--no-rewrite", "test"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let _held_stdin = child.stdin.take();
+    let mut stdout = child.stdout.take().context("stdout missing")?;
+    let mut banner = [0; 6];
+    timeout(Duration::from_secs(5), stdout.read_exact(&mut banner)).await??;
+    assert_eq!(&banner, b"banner");
+    // OpenSSH sends SIGHUP to its ProxyCommand when the client exits.
+    let pid = child.id().context("pid missing")?.to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-HUP", &pid])
+            .status()
+            .await?
+            .success()
+    );
+    let status = timeout(Duration::from_secs(5), child.wait()).await??;
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .context("stderr missing")?
+        .read_to_string(&mut stderr)
+        .await?;
+    assert!(status.success(), "{status:?}: {stderr}");
+    assert!(
+        stderr.contains("disconnected error=None received=6"),
+        "{stderr}"
+    );
+    timeout(Duration::from_secs(5), server).await???;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failing_connect_error_hook_does_not_stop_route_fallback() -> Result<()> {
+    let closed = TcpListener::bind("127.0.0.1:0").await?;
+    let port = closed.local_addr()?.port();
+    drop(closed);
+    let directory = tempfile::tempdir()?;
+    let ssh = directory.path().join("ssh");
+    executable(&ssh, "#!/bin/sh\nprintf 'SSH-2.0-fallback\\r\\n'\ncat\n")?;
+    let path = directory.path().join("config.toml");
+    fs::write(
+        &path,
+        format!(
+            "[settings]\noutput='generated.conf'\nknown_hosts='known.json'\nssh_binary='{}'\n\
+             [hosts.db]\nhostname='127.0.0.1'\nport={port}\ngateways=['direct','healthy']\n\
+             [hosts.db.hooks]\non_connect_error=[{{driver='exec',command='exit 3'}}]\n",
+            ssh.display()
+        ),
+    )?;
+    let output = timeout(
+        Duration::from_secs(5),
+        binary()
+            .arg("-c")
+            .arg(path)
+            .args(["connect", "--no-rewrite", "db"])
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await??;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(output.stdout, b"SSH-2.0-fallback\r\n");
+    assert!(stderr.contains("connect error hook failed"), "{stderr}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn nested_hops_skip_configuration_rewrites() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await?;
+        socket.write_all(b"banner").await?;
+        socket.shutdown().await?;
+        Ok::<_, std::io::Error>(())
+    });
+    let (dir, path) = fixture(&format!("[hosts.test]\nhostname='127.0.0.1'\nport={port}"))?;
+    let outer = binary()
+        .arg("-c")
+        .arg(&path)
+        .args(["connect", "test"])
+        .stdin(Stdio::null())
+        .output()
+        .await?;
+    assert!(!outer.status.success());
+    assert!(String::from_utf8(outer.stderr)?.contains("configuration updated"));
+    fs::remove_file(dir.path().join("generated.conf"))?;
+
+    let nested = timeout(
+        Duration::from_secs(5),
+        binary()
+            .env("SSHWEAVE_ROUTE_STACK", r#"["outer"]"#)
+            .arg("-c")
+            .arg(&path)
+            .args(["connect", "test"])
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await??;
+    assert!(nested.status.success(), "{nested:?}");
+    assert_eq!(nested.stdout, b"banner");
+    assert!(!dir.path().join("generated.conf").exists());
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_dial_honors_address_family_and_bind_address() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let server = tokio::spawn(async move {
+        let (mut socket, peer) = listener.accept().await?;
+        socket.write_all(b"banner").await?;
+        socket.shutdown().await?;
+        Ok::<_, std::io::Error>(peer)
+    });
+    let connect = |ssh: &str| {
+        let (dir, path) = fixture(&format!(
+            "[hosts.test]\nhostname='127.0.0.1'\nport={port}\n[hosts.test.ssh]\n{ssh}"
+        ))
+        .expect("fixture");
+        let mut command = binary();
+        command
+            .arg("-c")
+            .arg(&path)
+            .args(["connect", "--no-rewrite", "test"])
+            .stdin(Stdio::null());
+        (dir, command)
+    };
+    let (_dir, mut command) = connect("AddressFamily='inet6'\n");
+    let output = timeout(Duration::from_secs(5), command.output()).await??;
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)?.contains("no address allowed by AddressFamily"));
+
+    let (_dir, mut command) = connect("BindAddress='::1'\n");
+    let output = timeout(Duration::from_secs(5), command.output()).await??;
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)?.contains("BindAddress has no address for"));
+
+    let (_dir, mut command) = connect("AddressFamily='inet'\nBindAddress='127.0.0.1'\n");
+    let output = timeout(Duration::from_secs(5), command.output()).await??;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"banner");
+    assert!(server.await??.ip().is_loopback());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wrapper_uses_configured_clients_and_preserves_signal_exits() -> Result<()> {
+    use std::os::unix::process::ExitStatusExt;
+    let directory = tempfile::tempdir()?;
+    let scp = directory.path().join("custom-scp");
+    executable(&scp, "#!/bin/sh\nprintf '%s\\n' \"$@\"\nkill -TERM $$\n")?;
+    let path = directory.path().join("config.toml");
+    fs::write(
+        &path,
+        format!(
+            "[settings]\noutput='generated.conf'\nknown_hosts='known.json'\nscp_binary='{}'\n",
+            scp.display()
+        ),
+    )?;
+    let output = timeout(
+        Duration::from_secs(5),
+        binary()
+            .arg("-c")
+            .arg(&path)
+            .args(["wrapper", "scp", "file", "db:/tmp/"])
+            .output(),
+    )
+    .await??;
+    assert_eq!(output.status.signal(), Some(15), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.starts_with("-F\n"), "{stdout}");
+    assert!(stdout.ends_with("file\ndb:/tmp/\n"), "{stdout}");
+    assert!(!directory.path().join("known.json").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn explain_reports_every_matching_rule() -> Result<()> {
+    let (_dir, path) = fixture(
+        "[hosts.\"*.prod\"]\nuser='produser'\n[hosts.\"db*\"]\nport=2022\n[hosts.\"db*\".ssh]\nIdentityFile='~/.ssh/db'\n\
+         [hosts.\"regex:^(db[a-z]+)\\\\.prod$\"]\nhostname='{1}.internal'\n",
+    )?;
+    let output = binary()
+        .arg("-c")
+        .arg(&path)
+        .args(["config", "explain", "dbx.prod"])
+        .output()
+        .await?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(output.status.success(), "{stdout}");
+    for expected in [
+        "dbx.prod -> produser@dbx.internal:2022\n",
+        "matched: host *.prod\nmatched: host db*\nmatched: host regex:",
+        "hostname: {1}.internal\n  from host regex:^(db[a-z]+)\\.prod$\n  resolved as dbx.internal\n",
+        "port: 2022\n  from host db*\n",
+        "ssh.IdentityFile: ~/.ssh/db\n  from host db*\n",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
+    }
+    assert!(!stdout.contains("built-in default"), "{stdout}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn rendering_inputs_include_referenced_environment_variables() -> Result<()> {
+    let (_dir, path) = fixture("[hosts.db]\nhostname='${SSHWEAVE_TEST_REGION}.example.net'\n")?;
+    for (region, expected) in [
+        ("east", "Updated"),
+        ("east", "Unchanged"),
+        ("west", "Updated"),
+    ] {
+        let output = binary()
+            .env("SSHWEAVE_TEST_REGION", region)
+            .arg("-c")
+            .arg(&path)
+            .args(["config", "build", "--write"])
+            .output()
+            .await?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(output.status.success(), "{stderr}");
+        assert!(stderr.contains(expected), "{region}: {stderr}");
+    }
     Ok(())
 }

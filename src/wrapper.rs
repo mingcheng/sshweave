@@ -2,8 +2,7 @@
 
 use anyhow::{Context, Result, ensure};
 use sshweave::{config::Config, runtime, store, util};
-use std::process::Stdio;
-use tokio::process::Command;
+use std::process::Command;
 
 /// Programs supported by `sshweave wrapper`.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,23 +162,31 @@ fn destination(program: Program, value: &str) -> Result<Option<&str>> {
         .filter(|h| !h.contains('/')))
 }
 
-/// Registers targets, refreshes configuration, and preserves the wrapped exit code.
+/// Registers targets, refreshes configuration, and replaces this process with
+/// the wrapped program so signals and exit statuses pass through unchanged.
 pub(crate) async fn run(config: &Config, program: Program, args: Vec<String>) -> Result<i32> {
     ensure!(!args.is_empty(), "wrapper requires program arguments");
     let targets = targets(program, &args)?;
-    store::remember(config, &targets)?;
-    store::sync(config, config.document.settings.automatic_rewrite).await?;
     let resolver = config.resolver()?;
+    // Like `connect`, register only names that need their own stanza.
+    let materialized: Vec<String> = targets
+        .iter()
+        .filter(|target| resolver.requires_materialization(target))
+        .cloned()
+        .collect();
+    store::remember_with(&resolver, &materialized)?;
+    store::sync_with(&resolver, config.document.settings.automatic_rewrite).await?;
     for target in &targets {
         runtime::prepare_control_path(&resolver.resolve(target)?)?;
     }
     let output = config.output()?;
-    let mut command = match program {
-        Program::Ssh => Command::new(config.ssh_binary()?),
-        Program::Scp => Command::new("scp"),
-        Program::Sftp => Command::new("sftp"),
-        Program::Rsync => Command::new("rsync"),
-    };
+    let settings = &config.document.settings;
+    let mut command = Command::new(config.program(match program {
+        Program::Ssh => &settings.ssh_binary,
+        Program::Scp => &settings.scp_binary,
+        Program::Sftp => &settings.sftp_binary,
+        Program::Rsync => &settings.rsync_binary,
+    })?);
     if program == Program::Rsync {
         let ssh_binary = config.ssh_binary()?;
         let rsh = shell_words::join([
@@ -193,14 +200,20 @@ pub(crate) async fn run(config: &Config, program: Program, args: Vec<String>) ->
     } else {
         command.arg("-F").arg(output);
     }
-    let status = command
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-        .context("execute wrapped program")?;
+    command.args(args);
+    exec(command)
+}
+
+#[cfg(unix)]
+fn exec(mut command: Command) -> Result<i32> {
+    use std::os::unix::process::CommandExt;
+    // `exec` only returns on failure.
+    Err(command.exec()).context("execute wrapped program")
+}
+
+#[cfg(not(unix))]
+fn exec(mut command: Command) -> Result<i32> {
+    let status = command.status().context("execute wrapped program")?;
     Ok(status.code().unwrap_or(1))
 }
 

@@ -3,10 +3,11 @@
 
 use crate::{
     config::{Config, Host},
-    resolver::{self, ResolvedHost},
+    resolver::{self, ResolvedHost, Resolver},
     util,
 };
 use anyhow::{Context, Result, ensure};
+use sha1::{Digest, Sha1};
 use std::{collections::BTreeSet, fmt::Write};
 
 /// First line of every generated file; sshweave refuses to overwrite files
@@ -141,6 +142,67 @@ fn proxy_command_stanza(
     Ok(())
 }
 
+/// Prefix of the generated line carrying the input and content fingerprints.
+const DIGEST_PREFIX: &str = "# digest ";
+
+/// Fingerprints every input that affects [`ssh_config`]: the sshweave version,
+/// loaded source files, materialized targets, the rewrite mode, the
+/// ProxyCommand binary, and the environment variables used during rendering.
+pub fn input_digest(
+    config: &Config,
+    known: &BTreeSet<String>,
+    automatic_rewrite: bool,
+) -> Result<String> {
+    let mut digest = Sha1::new();
+    let mut field = |value: &[u8]| {
+        digest.update(value.len().to_le_bytes());
+        digest.update(value);
+    };
+    field(env!("CARGO_PKG_VERSION").as_bytes());
+    field(config.source_digest().as_bytes());
+    field(&[u8::from(automatic_rewrite)]);
+    field(config.binary()?.to_string_lossy().as_bytes());
+    for target in known {
+        field(target.as_bytes());
+    }
+    for name in ["HOME", "USER"]
+        .into_iter()
+        .chain(config.env_references().iter().map(String::as_str))
+    {
+        field(name.as_bytes());
+        match std::env::var_os(name) {
+            Some(value) => field(value.to_string_lossy().as_bytes()),
+            None => field(&[]),
+        }
+    }
+    Ok(util::hex(&digest.finalize()))
+}
+
+/// Returns whether `text` is a managed file generated from inputs matching
+/// `inputs` and left unmodified since, so it can be reused without rendering.
+pub fn is_current(text: &str, inputs: &str) -> bool {
+    let Some(rest) = text.strip_prefix(HEADER) else {
+        return false;
+    };
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        offset += line.len();
+        if let Some(value) = line.strip_prefix(DIGEST_PREFIX) {
+            return value
+                .trim_end()
+                .split_once(' ')
+                .is_some_and(|(input, content)| {
+                    input == inputs
+                        && content == util::hex(&Sha1::digest(&rest.as_bytes()[offset..]))
+                });
+        }
+        if !line.starts_with('#') {
+            break;
+        }
+    }
+    false
+}
+
 /// Renders the complete OpenSSH configuration.
 ///
 /// Layout: concrete hosts (configured names plus `known` materialized targets
@@ -153,9 +215,17 @@ pub fn ssh_config(
     known: &BTreeSet<String>,
     automatic_rewrite: bool,
 ) -> Result<String> {
-    let resolver = config.resolver()?;
-    let mut output = HEADER.to_owned();
-    writeln!(output, "# sshweave {}", env!("CARGO_PKG_VERSION"))?;
+    ssh_config_with(&config.resolver()?, known, automatic_rewrite)
+}
+
+/// Like [`ssh_config`], reusing an already compiled [`Resolver`].
+pub fn ssh_config_with(
+    resolver: &Resolver<'_>,
+    known: &BTreeSet<String>,
+    automatic_rewrite: bool,
+) -> Result<String> {
+    let config = resolver.config();
+    let mut output = String::new();
     let mut names = config.concrete_names();
     names.extend(known.iter().cloned());
     let names = resolver.route_targets(names)?;
@@ -177,7 +247,12 @@ pub fn ssh_config(
     exclusions.extend(globs.iter().map(|pattern| format!("!{pattern}")));
     defaults_stanza(&mut output, resolver.defaults(), &exclusions)?;
     proxy_command_stanza(&mut output, config, automatic_rewrite)?;
-    Ok(output)
+    Ok(format!(
+        "{HEADER}# sshweave {}\n{DIGEST_PREFIX}{} {}\n{output}",
+        env!("CARGO_PKG_VERSION"),
+        input_digest(config, known, automatic_rewrite)?,
+        util::hex(&Sha1::digest(output.as_bytes()))
+    ))
 }
 
 /// Renders gateway, proxy, alias, and inheritance relationships as Graphviz DOT.

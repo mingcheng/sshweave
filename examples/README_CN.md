@@ -105,6 +105,10 @@ wrapper 通过 `-F` 使用生成文件，而不是通常的 `~/.ssh/config`。
 请把所需主机设置写入 TOML；若要合并生成配置与手写配置，
 使用 [Include 接入方式](#openssh-include-与自动更新)。
 
+wrapper 会以所选程序替换自身进程，因此信号与退出状态（包括被信号终止）
+会原样传给调用方。可通过 `settings.scp_binary`、`settings.sftp_binary`、
+`settings.rsync_binary` 指定其他客户端；SSH 使用 `settings.ssh_binary`。
+
 程序名后的参数属于该程序：SSH 端口使用 `-p`，SCP/SFTP 使用 `-P`。
 sshweave 自身的选项放在 `wrapper` 之前，例如
 `sshweave --debug wrapper ssh database`；wrapper 帮助使用 `sshweave help wrapper`。
@@ -144,6 +148,10 @@ OpenSSH 使用第一个生效的值，Include 的位置影响优先级。
 生成配置中的 `Host *` 也会为未列出的目标启用 sshweave 路由。
 需要其他代理的手写设置应放在 Include 之前，或使用专用 `ssh -F` 配置。
 
+生成文件会记录其输入（源文件、缓存目标、引用的环境变量、sshweave 可执行文件
+及版本）和自身内容的指纹。连接时若文件未被修改且仍是最新，则直接复用，
+既不重新生成也不加锁；嵌套的网关跳不会重写该文件。
+
 配置变更或首次使用新的模式主机、链式目标时，这种方式可能会更新生成文件，
 并要求重新运行 SSH；wrapper 可避免这次重试。
 设置 `settings.automatic_rewrite = false` 可关闭此类自动更新，
@@ -177,6 +185,9 @@ sshweave 只覆盖带有自身标记的生成文件，**不会自动改写手写
 output = "~/.config/sshweave/sshweave.conf"
 registry = "~/.config/sshweave/sshweave_known_hosts.json"
 ssh_binary = "ssh"
+scp_binary = "scp"
+sftp_binary = "sftp"
+rsync_binary = "rsync"
 automatic_rewrite = true
 
 [defaults]
@@ -212,6 +223,8 @@ LocalForward = ["8080 localhost:80", "9090 localhost:90"]
   与默认 conf.d 不同，显式 include 模式必须匹配到已有文件。
   `[settings]` 只取根文件中的配置。
 - 同名条目按字段合并：根文件 > 后面的 include > 前面的 include。
+  `aliases` 和 `inherits` 同样如此：后面的条目省略它们（或设为 `[]`）时保留
+  前面的列表，非空列表则整体替换。
   自动加载的 conf.d 位于显式 includes 之前，除非自行将它列在其他位置。
 - 继承优先级：主机自身 > 第一个父项 > 后续父项，父项也可继续继承。
   先查模板，再查主机；用 `template:name` 或 `host:name` 可明确指定。
@@ -270,6 +283,11 @@ proxy_command = ["nc", "%h", "%p"]
   常规 SSH 选项遵循 OpenSSH 的 token 规则。
 - 用户名放在 `user` 或命令行的 `user@host` 中，不要写入 TOML 主机键名。
 
+sshweave 自身发起的 TCP 连接（直连路线和 `ping` 探测）遵循被拨主机的
+`AddressFamily`（`any`、`inet`、`inet6`）与 `BindAddress` SSH 选项。
+解析出多个地址时，某次尝试失败或经过 250 ms 后即开始下一次尝试，并交替使用
+IPv6 与 IPv4，因此一个不可达的地址族不会耗尽整个 `connect_timeout`。
+
 ## 网关与故障切换
 
 可在主机、模板或 defaults 中设置 `gateways` 与 `gateway_strategy`，两者独立继承。
@@ -279,7 +297,7 @@ proxy_command = ["nc", "%h", "%p"]
 | -------------------- | --------------------------------------------------------- | -------------------------- |
 | `sequential`（默认） | 按列表顺序尝试候选路由                                    | 依次尝试后续候选           |
 | `random`             | 每次连接随机打乱全部候选路由，每个列表项尝试一次          | 依次尝试剩余候选           |
-| `chain`          | 按列表顺序经过所有跳板，本机 → 第一项 → 第二项 → … → 目标 | 整条链失败，不绕过任何跳板 |
+| `chain`              | 按列表顺序经过所有跳板，本机 → 第一项 → 第二项 → … → 目标 | 整条链失败，不绕过任何跳板 |
 
 ```toml
 [hosts.balanced]
@@ -409,9 +427,12 @@ on_disconnect = [
 stats 包含 `sent_bytes`、`received_bytes`、`duration_seconds`、
 `average_bytes_per_second` 和 `connected_at`/`disconnected_at`（Unix 秒）。
 桌面通知需要 macOS 的 `osascript` 或 Linux 的 `notify-send`。
+`on_connect_error` hook 失败只记录日志，不会中止后续路线的尝试。
 
 `on_connect` 表示传输已建立，不表示 SSH 认证成功。该事件的 notify 标题是 `sshweave: transport established`。
 `on_disconnect` 在传输连接关闭时触发，而不是在每个复用的 SSH 会话结束时触发。
+OpenSSH 客户端退出时会用 SIGHUP 结束 ProxyCommand，此时同样触发；
+SIGTERM 和 SIGINT 也会触发该 hook，并带有 `error` 值。
 
 exec/daemon 还会获得 JSON 环境变量 `SSHWEAVE_CONTEXT`。若在 shell 模板中插入
 文本，请使用 `{{ host.name | shellquote }}`，或从 JSON 环境变量读取。
@@ -419,25 +440,26 @@ exec/daemon 还会获得 JSON 环境变量 `SSHWEAVE_CONTEXT`。若在 shell 模
 
 ## 命令
 
-| 用途                         | 命令                                              |
-| ---------------------------- | ------------------------------------------------- |
-| 验证指定配置                 | `sshweave -c ./sshweave.toml config check`        |
-| 输出生成的 OpenSSH 配置      | `sshweave config build`                           |
-| 更新受管理的配置文件         | `sshweave config build --write`                   |
-| 生成不自动更新的配置         | `sshweave config build --no-automatic-rewrite`    |
-| 列出主机、别名和模式         | `sshweave config list`                            |
-| 以 JSON 列出解析后的主机     | `sshweave config list --json`                     |
-| 搜索主机                     | `sshweave config search production`               |
-| 查看主机或链式目标           | `sshweave config resolve database/bastion`        |
-| 查看每个字段来自哪一层配置   | `sshweave config explain database`                |
-| 导出合并后的配置             | `sshweave config json`                            |
-| 导出解析后的具体主机         | `sshweave config json --expand`                   |
-| 以 JSON 预览路由，不连接     | `sshweave connect --dry-run database`             |
-| 将关系导出为 Graphviz DOT    | `sshweave config graphviz`                        |
-| 探测所选路线第一跳的 TCP 延迟 | `sshweave ping --count 4 --interval 0.5 database` |
-| 检查 Include 并打印 Git 的 SSH 命令 | `sshweave doctor`                         |
-| 查看版本、路径及已加载文件   | `sshweave info`                                   |
-| 生成 shell 补全              | `sshweave completions zsh`                        |
+| 用途                                | 命令                                              |
+| ----------------------------------- | ------------------------------------------------- |
+| 验证指定配置                        | `sshweave -c ./sshweave.toml config check`        |
+| 输出生成的 OpenSSH 配置             | `sshweave config build`                           |
+| 更新受管理的配置文件                | `sshweave config build --write`                   |
+| 生成不自动更新的配置                | `sshweave config build --no-automatic-rewrite`    |
+| 列出主机、别名和模式                | `sshweave config list`                            |
+| 以 JSON 列出解析后的主机            | `sshweave config list --json`                     |
+| 搜索主机                            | `sshweave config search production`               |
+| 查看主机或链式目标                  | `sshweave config resolve database/bastion`        |
+| 查看每个字段来自哪一层配置          | `sshweave config explain database`                |
+| 导出合并后的配置                    | `sshweave config json`                            |
+| 导出解析后的具体主机                | `sshweave config json --expand`                   |
+| 以 JSON 预览路由，不连接            | `sshweave connect --dry-run database`             |
+| 将关系导出为 Graphviz DOT           | `sshweave config graphviz`                        |
+| 探测所选路线第一跳的 TCP 延迟       | `sshweave ping --count 4 --interval 0.5 database` |
+| 检查 Include 并打印 Git 的 SSH 命令 | `sshweave doctor`                                 |
+| 查看版本、路径及已加载文件          | `sshweave info`                                   |
+| 清理不再需要的缓存目标              | `sshweave cache prune --dry-run`                  |
+| 生成 shell 补全                     | `sshweave completions zsh`                        |
 
 全局选项 `--config`/`-c`、`--verbose`/`-v`、`--debug`。
 支持 `SSHWEAVE_CONFIG`、`SSHWEAVE_DEBUG` 和标准 `RUST_LOG`。
@@ -449,6 +471,9 @@ exec/daemon 还会获得 JSON 环境变量 `SSHWEAVE_CONTEXT`。若在 shell 模
 `-p` 只在探测目标本身时覆盖端口。默认探测 4 次，
 `--count 0` 持续运行至 Ctrl+C；没有成功探测时返回失败状态。
 `doctor` 打印 Include 行和 `GIT_SSH_COMMAND`；Include 写在 `Host` 或 `Match` 之后会报错。
+未设置 `settings.binary` 时，生成的 ProxyCommand 使用最近一次写入它的 sshweave
+可执行文件路径；`doctor` 会报告不一致。从多个位置运行 sshweave 会导致它们轮流
+重写该文件，因此请将 `settings.binary` 设为一个固定路径。
 `config build --write` 在覆盖已托管文件之前，列出新增和删除的 `Host` 行。
 使用 `sshweave config graphviz | dot -Tsvg > hosts.svg` 导出 SVG，
 需另外安装 Graphviz 的 `dot` 命令。
@@ -483,6 +508,7 @@ sshweave sockets flush
 ### 管理已实例化主机缓存
 
 动态主机和链式目标使用过的名称会记录在 `settings.registry` 中（仍接受旧键名 `known_hosts`）。
+只记录需要独立生成配置段的名称：显式链、仅通过模式匹配的名称及其经过的网关。
 这是目标名称缓存，**不是 OpenSSH 的主机密钥数据库**。
 使用 `cache list` 返回的名称替换下面的 `old-worker`：
 
@@ -500,7 +526,8 @@ sshweave config build --write
 
 删除只修改缓存。显式 build 或使用 wrapper 后，生成配置才会刷新；
 静态主机及其他路由仍需使用的网关会保留。再次连接可能重新加入已删除的名称，
-已有名称不会自动淘汰。OpenSSH 主机密钥、源 TOML、私钥和控制套接字均不会修改。
+已有名称不会自动淘汰；`sshweave cache prune` 可删除不再需要独立配置段的名称，
+例如对应模式已删除的名称，或旧版本缓存的普通名称，可先用 `--dry-run` 预览。OpenSSH 主机密钥、源 TOML、私钥和控制套接字均不会修改。
 
 生成配置最多支持 4096 个不同目标，包含静态名称、别名、缓存目标及网关链组件。
 若旧缓存导致达到上限，可删除不再使用的名称。

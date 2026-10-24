@@ -154,3 +154,43 @@ fn cache_cli_recovers_an_overfull_registry_without_touching_output() -> Result<(
     assert!(String::from_utf8(unknown.stderr)?.contains("is not registered"));
     Ok(())
 }
+
+#[test]
+fn prune_keeps_only_targets_that_need_generated_stanzas() -> Result<()> {
+    let (_directory, config) = fixture(
+        "[hosts.bastion]\n[hosts.\"web-*\"]\ngateways=['jump']\n[hosts.fixed]\naliases=['alias']\n",
+    )?;
+    let registry: BTreeSet<String> = [
+        "alias",
+        "db/bastion",
+        "fixed",
+        "jump",
+        "plain.example.net",
+        "web-1",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let bytes = serde_json::to_vec(&registry)?;
+    fs::write(config.known_hosts()?, &bytes)?;
+
+    let preview = cli(&config, &["cache", "prune", "--dry-run"])?;
+    assert!(preview.status.success(), "{preview:?}");
+    assert_eq!(
+        String::from_utf8(preview.stdout)?,
+        "alias\nfixed\nplain.example.net\n"
+    );
+    assert_eq!(fs::read(config.known_hosts()?)?, bytes);
+
+    let removed = store::prune(&config, false)?;
+    assert_eq!(removed.len(), 3);
+    assert_eq!(
+        store::known_hosts(&config)?,
+        ["db/bastion", "jump", "web-1"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+    assert!(store::prune(&config, false)?.is_empty());
+    Ok(())
+}

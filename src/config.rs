@@ -8,6 +8,7 @@ use crate::{hooks::Hook, util};
 use anyhow::{Context, Result, ensure};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
@@ -179,6 +180,20 @@ impl Host {
         }
     }
 
+    /// Merges a same-name entry from an earlier file into this later one.
+    ///
+    /// Fields are merged like [`Host::fallback`]; `aliases` and `inherits`
+    /// are also kept from `earlier` when this entry leaves them empty.
+    fn merge_earlier(&mut self, earlier: &Self) {
+        self.fallback(earlier);
+        if self.aliases.is_empty() {
+            self.aliases.clone_from(&earlier.aliases);
+        }
+        if self.inherits.is_empty() {
+            self.inherits.clone_from(&earlier.inherits);
+        }
+    }
+
     /// Looks up a raw OpenSSH option case-insensitively.
     pub fn ssh_option(&self, key: &str) -> Option<&SshValue> {
         self.ssh
@@ -248,6 +263,7 @@ impl Host {
         self.validate_gateway_strategy()
             .context("gateway_strategy")?;
         self.validate_ssh_options()?;
+        crate::runtime::DialOptions::from_host(self)?;
         for hook in self.hooks.values().flatten() {
             hook.validate()?;
         }
@@ -290,6 +306,12 @@ pub struct Settings {
     pub known_hosts: String,
     /// OpenSSH client used for gateways, wrappers, and control sockets.
     pub ssh_binary: String,
+    /// `scp` client used by `sshweave wrapper scp`.
+    pub scp_binary: String,
+    /// `sftp` client used by `sshweave wrapper sftp`.
+    pub sftp_binary: String,
+    /// `rsync` client used by `sshweave wrapper rsync`.
+    pub rsync_binary: String,
     /// sshweave executable referenced by the generated ProxyCommand.
     pub binary: Option<String>,
     /// Regenerate the configuration automatically on connect.
@@ -302,6 +324,9 @@ impl Default for Settings {
             output: "~/.config/sshweave/sshweave.conf".into(),
             known_hosts: "~/.config/sshweave/sshweave_known_hosts.json".into(),
             ssh_binary: "ssh".into(),
+            scp_binary: "scp".into(),
+            sftp_binary: "sftp".into(),
+            rsync_binary: "rsync".into(),
             binary: None,
             automatic_rewrite: true,
         }
@@ -343,13 +368,19 @@ pub struct Config {
     pub files: Vec<PathBuf>,
     /// The merged document.
     pub document: Document,
+    /// SHA-1 over every loaded file path and its contents, in load order.
+    #[serde(skip)]
+    source_digest: String,
+    /// Environment variables referenced as `${NAME}` by any loaded file.
+    #[serde(skip)]
+    env_references: BTreeSet<String>,
 }
 
 /// Merges `incoming` entries into `existing`; later files take precedence.
 fn merge_entries(existing: &mut IndexMap<String, Host>, incoming: IndexMap<String, Host>) {
     for (name, mut host) in incoming {
         if let Some(current) = existing.get_mut(&name) {
-            host.fallback(current);
+            host.merge_earlier(current);
             *current = host;
         } else {
             existing.insert(name, host);
@@ -397,10 +428,14 @@ impl Config {
             source: source.clone(),
             files: Vec::new(),
             document: Document::default(),
+            source_digest: String::new(),
+            env_references: BTreeSet::new(),
         };
         let mut active = BTreeSet::new();
         let mut seen = BTreeSet::new();
-        result.load_file(&source, true, &mut active, &mut seen)?;
+        let mut digest = Sha1::new();
+        result.load_file(&source, true, &mut active, &mut seen, &mut digest)?;
+        result.source_digest = util::hex(&digest.finalize());
         result.validate()?;
         Ok(result)
     }
@@ -413,6 +448,7 @@ impl Config {
         root: bool,
         active: &mut BTreeSet<PathBuf>,
         seen: &mut BTreeSet<PathBuf>,
+        digest: &mut Sha1,
     ) -> Result<()> {
         let path = path
             .canonicalize()
@@ -431,6 +467,11 @@ impl Config {
         );
         active.insert(path.clone());
         let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        for part in [path.to_string_lossy().as_bytes(), text.as_bytes()] {
+            digest.update(part.len().to_le_bytes());
+            digest.update(part);
+        }
+        self.env_references.extend(util::env_references(&text));
         let mut doc: Document =
             toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
         let base = path
@@ -466,11 +507,11 @@ impl Config {
                 path.display()
             );
             for child in paths {
-                self.load_file(&child, false, active, seen)?;
+                self.load_file(&child, false, active, seen, digest)?;
             }
         }
         let mut defaults = doc.defaults;
-        defaults.fallback(&self.document.defaults);
+        defaults.merge_earlier(&self.document.defaults);
         self.document.defaults = defaults;
         self.document.proxies.extend(doc.proxies);
         merge_entries(&mut self.document.templates, doc.templates);
@@ -507,12 +548,27 @@ impl Config {
 
     /// OpenSSH client; bare names are looked up in `PATH`.
     pub fn ssh_binary(&self) -> Result<PathBuf> {
-        let value = util::expand_env(&self.document.settings.ssh_binary)?;
+        self.program(&self.document.settings.ssh_binary)
+    }
+
+    /// Resolves a configured client program; bare names are looked up in `PATH`.
+    pub fn program(&self, setting: &str) -> Result<PathBuf> {
+        let value = util::expand_env(setting)?;
         if value.contains('/') || value.starts_with('~') {
             self.path(&value)
         } else {
             Ok(PathBuf::from(value))
         }
+    }
+
+    /// Fingerprint of every loaded source file (paths and contents).
+    pub fn source_digest(&self) -> &str {
+        &self.source_digest
+    }
+
+    /// Names of environment variables referenced as `${NAME}` in source files.
+    pub fn env_references(&self) -> &BTreeSet<String> {
+        &self.env_references
     }
 
     /// Validates the complete merged configuration.
@@ -554,11 +610,14 @@ impl Config {
             &settings.output,
             &settings.known_hosts,
             &settings.ssh_binary,
+            &settings.scp_binary,
+            &settings.sftp_binary,
+            &settings.rsync_binary,
         ] {
             util::single_line(value)?;
             ensure!(
                 !value.is_empty(),
-                "settings paths and ssh_binary cannot be empty"
+                "settings paths and client binaries cannot be empty"
             );
         }
         Ok(())

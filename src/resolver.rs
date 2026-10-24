@@ -170,6 +170,11 @@ impl<'a> Resolver<'a> {
     pub fn defaults(&self) -> &Host {
         &self.defaults
     }
+
+    /// Returns the configuration this view was compiled from.
+    pub fn config(&self) -> &'a Config {
+        self.config
+    }
 }
 
 /// A target with every inherited and default value applied.
@@ -289,7 +294,7 @@ fn substitute_captures(hostname: &mut String, re: &regex::Regex, name: &str) {
     }
 }
 
-impl Resolver<'_> {
+impl<'a> Resolver<'a> {
     /// Returns whether `target` needs its own generated stanza: explicit
     /// chains and names matched only through patterns.
     pub fn requires_materialization(&self, target: &str) -> bool {
@@ -317,14 +322,9 @@ impl Resolver<'_> {
         self.resolve_inner(target)
     }
 
-    /// Resolves without target validation (pattern keys are not valid targets).
-    ///
-    /// Matching entries are layered in priority order: the exact host key,
-    /// then literal aliases, then patterns in configuration order.
-    pub(crate) fn resolve_inner(&self, target: &str) -> Result<ResolvedHost> {
-        let mut parts = target.splitn(2, '/');
-        let name = parts.next().context("empty target")?;
-        let chain = parts.next();
+    /// Returns matching entries in layering order: the exact host key, then a
+    /// literal alias, then patterns in configuration order.
+    fn select(&self, name: &str) -> Vec<(usize, &Rule<'_>)> {
         let mut selected: Vec<(usize, &Rule<'_>)> = Vec::new();
         if let Some(index) = self.config.document.hosts.get_index_of(name) {
             selected.push((index, &self.entries[index].rules[0]));
@@ -341,6 +341,29 @@ impl Resolver<'_> {
                 selected.push((entry, rule));
             }
         }
+        selected
+    }
+
+    /// Returns the `[hosts]` keys layered into `target`, highest priority first.
+    ///
+    /// An explicit `/gateway` chain is ignored; only the destination name matches.
+    pub fn matched_entries(&self, target: &str) -> Vec<&'a str> {
+        let name = target.split('/').next().unwrap_or(target);
+        self.select(name)
+            .into_iter()
+            .map(|(entry, _)| self.entries[entry].name)
+            .collect()
+    }
+
+    /// Resolves without target validation (pattern keys are not valid targets).
+    ///
+    /// Matching entries are layered in priority order: the exact host key,
+    /// then literal aliases, then patterns in configuration order.
+    pub(crate) fn resolve_inner(&self, target: &str) -> Result<ResolvedHost> {
+        let mut parts = target.splitn(2, '/');
+        let name = parts.next().context("empty target")?;
+        let chain = parts.next();
+        let selected = self.select(name);
         let mut options = Host::default();
         for (index, (entry, rule)) in selected.iter().enumerate() {
             let mut incoming = self.entries[*entry].options.clone();

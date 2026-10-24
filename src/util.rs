@@ -43,6 +43,24 @@ pub fn expand_env(input: &str) -> Result<String> {
     Ok(result)
 }
 
+/// Returns the variable names referenced as `${NAME}` in `input`.
+pub fn env_references(input: &str) -> impl Iterator<Item = String> + '_ {
+    ENV_PATTERN
+        .captures_iter(input)
+        .map(|captures| captures[1].to_owned())
+}
+
+/// Formats bytes as lowercase hexadecimal.
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
 /// Expands environment variables and a leading `~`, then resolves relative
 /// paths against `base`.
 ///

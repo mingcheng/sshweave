@@ -108,6 +108,11 @@ The wrapper uses the generated file with `-F`, not your usual `~/.ssh/config`.
 Put required host settings in TOML, or use the [Include workflow](#openssh-include-and-automatic-updates)
 to combine generated and hand-written configuration.
 
+The wrapper replaces itself with the selected program, so signals and exit
+statuses (including termination by a signal) reach the caller unchanged. Set
+`settings.scp_binary`, `settings.sftp_binary`, or `settings.rsync_binary` to use
+other clients; SSH uses `settings.ssh_binary`.
+
 Arguments after the program name belong to that program: SSH uses `-p` for a
 port, while SCP/SFTP use `-P`. Put sshweave options before `wrapper`, for example
 `sshweave --debug wrapper ssh database`; use `sshweave help wrapper` for help.
@@ -150,6 +155,11 @@ The generated `Host *` applies sshweave routing to unlisted destinations too.
 Put hand-written settings requiring a different proxy before the Include, or use
 a dedicated configuration with `ssh -F`.
 
+The generated file records a fingerprint of its inputs (source files, cached
+targets, referenced environment variables, and the sshweave binary and version)
+and of its own content. Connections reuse an unmodified, up-to-date file without
+rendering or locking it, and nested gateway hops never rewrite it.
+
 After configuration changes or the first use of a new pattern/chain target,
 this workflow may update the generated file and ask you to rerun SSH. The wrapper
 avoids that retry. Setting `settings.automatic_rewrite = false` disables these
@@ -185,6 +195,9 @@ merge them into existing tables; do not duplicate TOML table headers.
 output = "~/.config/sshweave/sshweave.conf"
 registry = "~/.config/sshweave/sshweave_known_hosts.json"
 ssh_binary = "ssh"
+scp_binary = "scp"
+sftp_binary = "sftp"
+rsync_binary = "rsync"
 automatic_rewrite = true
 
 [defaults]
@@ -220,6 +233,8 @@ LocalForward = ["8080 localhost:80", "9090 localhost:90"]
   Unlike the default conf.d, explicit include patterns must match existing files.
   Only the root file supplies `[settings]`.
 - Same-name entries merge by field: root file > later include > earlier include.
+  This includes `aliases` and `inherits`: a later entry that omits them (or sets
+  them to `[]`) keeps the earlier lists, while a non-empty list replaces them.
   The automatic conf.d is loaded before explicit includes unless you list it
   yourself at a different position.
 - Inheritance: host settings > first parent > subsequent parents. Parents may
@@ -284,6 +299,12 @@ proxy_command = ["nc", "%h", "%p"]
   `%i` (UID), `%d` (home), `%l`/`%L` (full/short hostname), `%C` (connection hash),
   and `%%` (literal percent). Ordinary SSH options use OpenSSH's token rules.
 - Put usernames in `user` or the command-line `user@host`, not in TOML host keys.
+
+sshweave's own TCP connections (direct routes and `ping` probes) honor the
+`AddressFamily` (`any`, `inet`, `inet6`) and `BindAddress` SSH options of the
+dialed host. With several resolved addresses, sshweave starts the next attempt
+when one fails or after 250 ms, alternating IPv6 and IPv4, so one unreachable
+address family does not consume the whole `connect_timeout`.
 
 ## Gateways and failover
 
@@ -432,11 +453,13 @@ values depend on the event: `host`, `gateway`, `stats`, and `error`.
 Stats include `sent_bytes`, `received_bytes`, `duration_seconds`,
 `average_bytes_per_second`, and `connected_at`/`disconnected_at` (Unix seconds).
 Desktop notifications require `osascript` on macOS or `notify-send` on Linux.
+A failing `on_connect_error` hook is logged and does not stop the remaining routes.
 
 `on_connect` means transport establishment, not successful SSH authentication.
 A `notify` hook for that event is titled `sshweave: transport established`.
 `on_disconnect` runs when the transport closes, not when each multiplexed SSH
-session ends.
+session ends. This includes OpenSSH stopping its ProxyCommand with SIGHUP when
+the client exits; SIGTERM and SIGINT also run the hook, with an `error` value.
 
 exec/daemon also receive the JSON environment variable `SSHWEAVE_CONTEXT`.
 When inserting text into shell templates, use `{{ host.name | shellquote }}` or
@@ -463,6 +486,7 @@ Configuration is **trusted executable input**; do not load untrusted TOML/hooks.
 | Probe TCP latency of the first route hop            | `sshweave ping --count 4 --interval 0.5 database` |
 | Check Include placement and print Git's SSH command | `sshweave doctor`                                 |
 | Show version, paths, and loaded files               | `sshweave info`                                   |
+| Remove cached targets that are no longer needed     | `sshweave cache prune --dry-run`                  |
 | Generate shell completions                          | `sshweave completions zsh`                        |
 
 Global options: `--config`/`-c`, `--verbose`/`-v`, and `--debug`.
@@ -476,7 +500,11 @@ or dial past that hop. `random` routes are probed in configuration order. `-p`
 overrides the port only when the probe is the destination itself. It defaults to
 4 probes; `--count 0` runs until Ctrl+C. No successful probes means a failure exit
 status. `doctor` prints the Include line and `GIT_SSH_COMMAND`; an Include placed
-after a `Host` or `Match` block is an error. `config build --write` lists added
+after a `Host` or `Match` block is an error. Without `settings.binary`, the
+generated ProxyCommand uses the path of the sshweave executable that last wrote
+it; `doctor` reports a mismatch, and running sshweave from more than one location
+makes them rewrite the file in turn, so set `settings.binary` to one stable path.
+`config build --write` lists added
 and removed `Host` lines before replacing a managed file. SVG export with `sshweave config graphviz | dot -Tsvg > hosts.svg`
 requires the optional Graphviz `dot` command.
 
@@ -511,7 +539,9 @@ changes; close them when ready to reconnect.
 ### Managing materialized targets
 
 Names used for dynamic hosts and chains are remembered in `settings.registry`
-(`known_hosts` is still accepted as an alias).
+(`known_hosts` is still accepted as an alias). Only names that need their own
+generated stanza are added: explicit chains, names matched only through patterns,
+and the gateways they route through.
 This is a target cache, **not OpenSSH's host-key database**.
 Use names from `cache list` in place of `old-worker` below:
 
@@ -529,7 +559,10 @@ use `sshweave cache clear` and rebuild. Add `--json` to `cache list` for scripts
 
 Removal updates only the cache. Rebuild or use a wrapper to refresh generated
 configuration; configured hosts and gateways still needed by other routes remain.
-Reconnecting can add a removed name again. No names are evicted automatically.
+Reconnecting can add a removed name again. No names are evicted automatically;
+`sshweave cache prune` removes names that no longer need their own stanza, such as
+names whose pattern was removed or plain names cached by older versions. Preview
+with `--dry-run`.
 OpenSSH host keys, source TOML, private keys, and control sockets are not changed.
 
 Generated configuration supports up to 4096 distinct targets, including configured
