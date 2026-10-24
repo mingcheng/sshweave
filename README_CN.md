@@ -53,57 +53,7 @@ sshweave --help
 平台要求及校验方法见 [发布包安装说明](examples/README_CN.md#发布包安装)。
 运行发布包中的二进制程序无需安装 Rust。
 
-### 配置主机
-
-创建配置目录：
-
-```sh
-mkdir -p ~/.config/sshweave
-```
-
-将以下内容保存为 `~/.config/sshweave/sshweave.toml`；如果已有配置，请合并而非覆盖。
-连接前，先将示例中的域名、地址和用户名替换为自己的实际值。
-
-```toml
-[defaults]
-user = "deploy"
-connect_timeout = 3
-
-[hosts.bastion]
-hostname = "bastion.example.net"
-user = "ops"
-
-[hosts.database]
-hostname = "10.0.0.10"
-gateways = ["direct", "bastion"]
-gateway_strategy = "sequential"
-```
-
-此配置先尝试直连数据库，再尝试通过跳板机连接。默认网关策略是 `random`；
-需要固定尝试顺序时，应显式设置 `sequential`。若要按固定链路依次经过每个跳板机，
-使用 `chain`，并仅列出 SSH 网关名称，不包含 `direct`；
-详见[网关与故障切换](examples/README_CN.md#网关与故障切换)。
-
-更多高级配置选项和示例，请参阅[示例指南](examples/README_CN.md)。
-
-## 重要行为说明
-
-- **配置归属：** sshweave 只覆盖带有自身标记的生成文件，不会自动编辑
-  `~/.ssh/config`、移动私钥或替换 OpenSSH 的 `known_hosts` 数据库。
-- **故障切换范围：** 仅在传输建立阶段、收到目标的第一个字节之前尝试备用路径。
-  sshweave 不会恢复已中断的 SSH 会话，也不会因 SSH 认证失败而重试其他路径。
-- **代理支持：** HTTP CONNECT 和 SOCKS5 目前仅支持无需认证的代理；
-  已配置的代理不会被静默绕过而改为直连。
-- **配置可信性：** hooks 和运行时命令可以执行程序，请只加载可信的配置文件。
-
-## 文档
-
-- **[配置与使用指南](examples/README_CN.md)：** 安装、继承、路由、代理、hooks、命令与维护。
-- **[完整示例配置](examples/sshweave.toml)：** 在同一个 TOML 文件中展示模板、模式、
-  网关策略、具名代理和 hooks。
-- **[English guide](examples/README.md)：** 英文配置与使用指南。
-
-文档以英文版本为准，中文版本同步相同内容。
+安装、配置示例和日常用法请参阅 **[配置与使用指南](examples/README_CN.md)**。也可阅读 [English guide](examples/README.md)。
 
 ## 致谢与许可
 
