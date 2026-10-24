@@ -38,6 +38,9 @@ macro_rules! default_config {
 /// Detailed build report for `--version`; `-V` keeps the short form for scripts.
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
+    "\n",
+    env!("CARGO_PKG_DESCRIPTION"),
+    "\n",
     "\ncommit:   ",
     env!("SSHWEAVE_BUILD_COMMIT"),
     " (",
@@ -51,8 +54,8 @@ const LONG_VERSION: &str = concat!(
     "\nconfig:   ",
     default_config!(),
     " (override with -c or SSHWEAVE_CONFIG)",
-    "\nlicense:  ",
-    env!("CARGO_PKG_LICENSE"),
+    "\nauthor:   ",
+    env!("CARGO_PKG_AUTHORS"),
     "\nhomepage: ",
     env!("CARGO_PKG_HOMEPAGE"),
 );
