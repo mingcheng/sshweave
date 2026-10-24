@@ -642,6 +642,93 @@ impl Config {
     pub(crate) fn inherit_defaults(&self) -> Result<Host> {
         Inheritance::new(self).defaults()
     }
+
+    /// Splits an `inherits` entry into its kind and name. Bare names prefer
+    /// templates over hosts.
+    fn parent_kind<'s>(&self, spec: &'s str) -> (&'static str, &'s str) {
+        match spec.split_once(':') {
+            Some(("host", rest)) => ("host", rest),
+            Some(("template", rest)) => ("template", rest),
+            _ if self.document.templates.contains_key(spec) => ("template", spec),
+            _ => ("host", spec),
+        }
+    }
+
+    /// Lists the layers merged for the given `[hosts]` keys, highest priority
+    /// first: each entry followed by its parents (depth-first, in `inherits`
+    /// order), then `[defaults]` and its parents. Layers already listed are
+    /// skipped, so folding them with [`Host::fallback`] reproduces resolution.
+    pub fn inheritance_layers(&self, entries: &[&str]) -> Result<Vec<InheritanceLayer<'_>>> {
+        let mut layers = Vec::new();
+        let mut seen = BTreeSet::new();
+        for entry in entries {
+            self.collect_layers(
+                &format!("host:{entry}"),
+                &mut layers,
+                &mut Vec::new(),
+                &mut seen,
+            )?;
+        }
+        if seen.insert("defaults:".to_owned()) {
+            layers.push(InheritanceLayer {
+                label: "defaults".to_owned(),
+                host: &self.document.defaults,
+            });
+            for parent in &self.document.defaults.inherits {
+                self.collect_layers(
+                    parent,
+                    &mut layers,
+                    &mut vec!["defaults:".to_owned()],
+                    &mut seen,
+                )?;
+            }
+        }
+        Ok(layers)
+    }
+
+    fn collect_layers<'s>(
+        &'s self,
+        spec: &str,
+        layers: &mut Vec<InheritanceLayer<'s>>,
+        stack: &mut Vec<String>,
+        seen: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let (kind, name) = self.parent_kind(spec);
+        let key = format!("{kind}:{name}");
+        ensure!(
+            stack.len() < MAX_INHERIT_DEPTH && !stack.contains(&key),
+            "inheritance cycle/depth limit: {} -> {key}",
+            stack.join(" -> ")
+        );
+        if !seen.insert(key.clone()) {
+            return Ok(());
+        }
+        let host = if kind == "template" {
+            self.document.templates.get(name)
+        } else {
+            self.document.hosts.get(name)
+        }
+        .with_context(|| format!("unknown inheritance parent {key}"))?;
+        layers.push(InheritanceLayer {
+            label: format!("{kind} {name}"),
+            host,
+        });
+        stack.push(key);
+        for parent in &host.inherits {
+            self.collect_layers(parent, layers, stack, seen)?;
+        }
+        stack.pop();
+        Ok(())
+    }
+}
+
+/// One source of settings in an inheritance chain; see [`Config::inheritance_layers`].
+#[derive(Clone, Debug)]
+pub struct InheritanceLayer<'a> {
+    /// `host NAME`, `template NAME`, or `defaults`.
+    pub label: String,
+    /// The settings declared by this layer itself.
+    pub host: &'a Host,
 }
 
 /// Memoizes inheritance only while its source configuration is immutably borrowed.
@@ -671,11 +758,7 @@ impl<'a> Inheritance<'a> {
     }
 
     fn visit(&mut self, name: &str, stack: &mut Vec<String>) -> Result<(Host, usize)> {
-        let (kind, name) = match name.split_once(':') {
-            Some((kind @ ("host" | "template"), rest)) => (kind, rest),
-            _ if self.config.document.templates.contains_key(name) => ("template", name),
-            _ => ("host", name),
-        };
+        let (kind, name) = self.config.parent_kind(name);
         let key = format!("{kind}:{name}");
         ensure!(
             stack.len() < MAX_INHERIT_DEPTH && !stack.contains(&key),

@@ -12,7 +12,14 @@ documentation = "https://github.com/mingcheng/sshweave/blob/HEAD/examples/README
 authors = ["mingcheng <mingcheng@apache.org>"]
 keywords = ["ssh", "openssh", "cli", "proxy", "gateway"]
 categories = ["command-line-utilities", "config", "network-programming"]
-exclude = [".github/", ".vscode/", ".editorconfig", ".gitattributes"]
+exclude = [
+  ".github/",
+  ".vscode/",
+  ".editorconfig",
+  ".gitattributes",
+  "scripts/",
+  "sshweave.webp",
+]
 
 [[bin]]
 name = "sshweave"

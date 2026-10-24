@@ -834,3 +834,113 @@ fn address_family_and_bind_address_are_validated() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn capture_placeholders_require_matching_regex_rules() -> Result<()> {
+    for (text, message) in [
+        (
+            "[hosts.\"*.dev\"]\nhostname = '{1}.example.net'\n",
+            "require a regex: host key or alias",
+        ),
+        (
+            "[hosts.\"regex:^db([0-9]+)$\"]\nhostname = 'node-{2}'\n",
+            "placeholder {2} is not a capture group",
+        ),
+        (
+            "[hosts.\"regex:^db([0-9]+)$\"]\nhostname = 'node-{id}'\n",
+            "placeholder {id} is not a capture group",
+        ),
+        (
+            "[hosts.edge]\naliases = ['regex:^edge([0-9]+)$', 'edge-*']\nhostname = 'e{1}'\n",
+            "cannot fill hostname capture placeholders",
+        ),
+        (
+            "[hosts.db]\nhostname = 'db}.example.net'\n",
+            "unmatched brace",
+        ),
+    ] {
+        let error = fixture(text).unwrap_err();
+        assert!(format!("{error:#}").contains(message), "{text}: {error:#}");
+    }
+    let (_dir, config) = fixture(
+        "[hosts.db]\nhostname = '${HOME}.example.net'\n\
+         [hosts.edge]\naliases = ['regex:^edge(?P<id>[0-9]+)$']\nhostname = 'edge-{id}-{1}.example.net'\n",
+    )?;
+    assert_eq!(config.resolve("edge3")?.hostname, "edge-3-3.example.net");
+    let error = config.resolve("edge").unwrap_err();
+    assert!(format!("{error:#}").contains("unfilled capture placeholders"));
+    assert!(!config.concrete_names().contains("edge"));
+    let generated = render::ssh_config(&config, &BTreeSet::from(["edge7".into()]), true)?;
+    assert!(!generated.contains("\nHost edge\n"));
+    assert!(generated.contains("\nHost edge7\n  HostName \"edge-7-7.example.net\""));
+    Ok(())
+}
+
+#[test]
+fn inheritance_layers_fold_to_the_resolved_options() -> Result<()> {
+    let (_dir, config) = fixture(
+        r#"
+[defaults]
+inherits = ["base"]
+connect_timeout = 9
+[templates.base]
+user = "base"
+port = 2201
+[templates.base.ssh]
+ServerAliveInterval = 30
+[templates.left]
+inherits = ["base"]
+rate_limit = "1 MiB/s"
+[templates.right]
+inherits = ["base", "template:edge"]
+port = 2202
+[templates.edge]
+comment = "edge template"
+[hosts.db]
+inherits = ["left", "right"]
+hostname = "10.0.0.1"
+[hosts."db*"]
+gateways = ["bastion"]
+[hosts."db*".ssh]
+IdentityFile = "~/.ssh/db"
+[hosts."*.prod"]
+inherits = ["edge"]
+user = "prod"
+[hosts.bastion]
+"#,
+    )?;
+    let resolver = config.resolver()?;
+    for target in ["db", "dbx.prod", "web.prod", "bastion", "unlisted"] {
+        let matched = resolver.matched_entries(target);
+        let mut folded = sshweave::config::Host::default();
+        for layer in config.inheritance_layers(&matched)? {
+            folded.fallback(layer.host);
+        }
+        let mut resolved = resolver.resolve(target)?.options;
+        // Entry metadata is not merged by `fallback`; compare settings only.
+        resolved.aliases.clear();
+        resolved.inherits.clear();
+        assert_eq!(
+            serde_json::to_value(&folded)?,
+            serde_json::to_value(&resolved)?,
+            "{target}"
+        );
+    }
+    let labels: Vec<_> = config
+        .inheritance_layers(&["db"])?
+        .into_iter()
+        .map(|layer| layer.label)
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "host db",
+            "template left",
+            "template base",
+            "template right",
+            "template edge",
+            "defaults"
+        ]
+    );
+    Ok(())
+}

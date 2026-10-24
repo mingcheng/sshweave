@@ -43,8 +43,23 @@ const RSYNC_LONG_OPTIONS_WITH_VALUE: &[&str] = &[
     "--remote-option",
 ];
 
+/// Destinations and option letters found in wrapped program arguments.
+#[derive(Debug, Default)]
+struct Parsed {
+    targets: Vec<String>,
+    /// Short options that took a value, such as `S` for scp/sftp `-S program`.
+    value_options: Vec<char>,
+}
+
 /// Locates destinations without interpreting or modifying the remote command.
+#[cfg(test)]
 fn targets(program: Program, args: &[String]) -> Result<Vec<String>> {
+    Ok(parse(program, args)?.targets)
+}
+
+/// Locates destinations and value options without interpreting the remote command.
+fn parse(program: Program, args: &[String]) -> Result<Parsed> {
+    let mut value_options = Vec::new();
     let mut positionals = Vec::new();
     let mut skip = false;
     let mut pending_option = None;
@@ -86,6 +101,7 @@ fn targets(program: Program, args: &[String]) -> Result<Vec<String>> {
                             !(program == Program::Rsync && flag == 'e'),
                             "wrapper manages rsync remote shell"
                         );
+                        value_options.push(flag);
                         skip = offset + flag.len_utf8() == flags.len();
                         if flag == 'o' && !skip {
                             check_ssh_override(&flags[offset + 1..])?;
@@ -113,7 +129,10 @@ fn targets(program: Program, args: &[String]) -> Result<Vec<String>> {
             targets.push(candidate.into());
         }
     }
-    Ok(targets)
+    Ok(Parsed {
+        targets,
+        value_options,
+    })
 }
 
 fn check_ssh_override(value: &str) -> Result<()> {
@@ -166,7 +185,10 @@ fn destination(program: Program, value: &str) -> Result<Option<&str>> {
 /// the wrapped program so signals and exit statuses pass through unchanged.
 pub(crate) async fn run(config: &Config, program: Program, args: Vec<String>) -> Result<i32> {
     ensure!(!args.is_empty(), "wrapper requires program arguments");
-    let targets = targets(program, &args)?;
+    let Parsed {
+        targets,
+        value_options,
+    } = parse(program, &args)?;
     let resolver = config.resolver()?;
     // Like `connect`, register only names that need their own stanza.
     let materialized: Vec<String> = targets
@@ -199,6 +221,11 @@ pub(crate) async fn run(config: &Config, program: Program, args: Vec<String>) ->
         command.args(["-e", &rsh]);
     } else {
         command.arg("-F").arg(output);
+        // scp and sftp start `ssh` from PATH unless told otherwise; an explicit
+        // user -S still wins.
+        if matches!(program, Program::Scp | Program::Sftp) && !value_options.contains(&'S') {
+            command.arg("-S").arg(config.ssh_binary()?);
+        }
     }
     command.args(args);
     exec(command)

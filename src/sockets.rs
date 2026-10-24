@@ -48,7 +48,7 @@ pub fn paths(config: &Config) -> Result<Vec<PathBuf>> {
             hosts.push(resolver.entry(name)?);
         }
     }
-    let mut names = config.concrete_names();
+    let mut names = resolver.concrete_names();
     names.extend(store::known_hosts(config)?);
     for name in resolver.route_targets(names)? {
         hosts.push(resolver.resolve(&name)?);

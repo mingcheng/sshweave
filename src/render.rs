@@ -226,7 +226,7 @@ pub fn ssh_config_with(
 ) -> Result<String> {
     let config = resolver.config();
     let mut output = String::new();
-    let mut names = config.concrete_names();
+    let mut names = resolver.concrete_names();
     names.extend(known.iter().cloned());
     let names = resolver.route_targets(names)?;
     for name in &names {

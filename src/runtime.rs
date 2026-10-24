@@ -599,7 +599,69 @@ async fn open(
 
 /// Relays stdin/stdout over `connection` until both directions finish, running
 /// `on_connect`/`on_disconnect` hooks around the transfer.
-async fn relay(connection: &mut Connection, host: &ResolvedHost) -> Result<Stats> {
+/// Termination signals handled for the whole connection lifetime.
+///
+/// Once registered, these signals no longer terminate the process by default,
+/// so every long wait must also watch them. Dropping the interrupted work kills
+/// its child processes (`kill_on_drop`).
+struct Signals {
+    hangup: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            hangup: signal(SignalKind::hangup())?,
+            terminate: signal(SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// Waits for the next termination signal and returns its name.
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.hangup.recv() => "SIGHUP",
+            _ = self.terminate.recv() => "SIGTERM",
+            _ = self.interrupt.recv() => "SIGINT",
+        }
+    }
+
+    /// Runs `work` unless a termination signal arrives first, which yields
+    /// an [`Interrupted`] error.
+    async fn guard<T>(
+        &mut self,
+        stage: &'static str,
+        work: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        tokio::select! {
+            result = work => result,
+            signal = self.recv() => Err(Interrupted { signal, stage }.into()),
+        }
+    }
+}
+
+/// A termination signal stopped work in progress.
+#[derive(Debug)]
+struct Interrupted {
+    signal: &'static str,
+    stage: &'static str,
+}
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} received during {}", self.signal, self.stage)
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+async fn relay(
+    connection: &mut Connection,
+    host: &ResolvedHost,
+    signals: &mut Signals,
+) -> Result<Stats> {
     let limiter = host
         .options
         .rate_limit
@@ -611,16 +673,16 @@ async fn relay(connection: &mut Connection, host: &ResolvedHost) -> Result<Stats
         connected_at: now()?,
         ..Stats::default()
     };
-    // Register before on_connect so a signal arriving during the hook is kept.
-    let mut hangup = signal(SignalKind::hangup())?;
-    let mut terminate = signal(SignalKind::terminate())?;
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    hooks::invoke(
-        &host.options,
-        Event::OnConnect,
-        &json!({"host": host, "stats": stats}),
-    )
-    .await?;
+    signals
+        .guard(
+            "on_connect hooks",
+            hooks::invoke(
+                &host.options,
+                Event::OnConnect,
+                &json!({"host": host, "stats": stats}),
+            ),
+        )
+        .await?;
     let sent = AtomicU64::new(0);
     let received = AtomicU64::new(0);
     let writer = connection
@@ -652,12 +714,13 @@ async fn relay(connection: &mut Connection, host: &ResolvedHost) -> Result<Stats
     // on_disconnect hooks still run instead of the process being killed.
     let transfer = tokio::select! {
         result = transfer => result,
-        _ = hangup.recv() => {
-            tracing::debug!("SIGHUP received; closing transport");
-            Ok(())
-        }
-        _ = terminate.recv() => Err(anyhow!("terminated by SIGTERM")),
-        _ = interrupt.recv() => Err(anyhow!("interrupted by SIGINT")),
+        signal = signals.recv() => match signal {
+            "SIGHUP" => {
+                tracing::debug!("SIGHUP received; closing transport");
+                Ok(())
+            }
+            other => Err(anyhow!("{other} received; closing transport")),
+        },
     };
     let cleanup = async {
         if let Some(child) = &mut connection.child {
@@ -678,12 +741,17 @@ async fn relay(connection: &mut Connection, host: &ResolvedHost) -> Result<Stats
     let total_bytes = (stats.sent_bytes + stats.received_bytes) as f64;
     stats.average_bytes_per_second = total_bytes / stats.duration_seconds.max(f64::EPSILON);
     let error = transfer.as_ref().err().map(ToString::to_string);
-    let hook = hooks::invoke(
-        &host.options,
-        Event::OnDisconnect,
-        &json!({"host": host, "stats": stats, "error": error}),
-    )
-    .await;
+    // A further signal abandons slow disconnect hooks instead of being ignored.
+    let hook = signals
+        .guard(
+            "on_disconnect hooks",
+            hooks::invoke(
+                &host.options,
+                Event::OnDisconnect,
+                &json!({"host": host, "stats": stats, "error": error}),
+            ),
+        )
+        .await;
     if let Err(error) = &hook {
         tracing::error!(error = %format!("{error:#}"), "disconnect hook failed");
     }
@@ -761,12 +829,15 @@ pub async fn connect_with(
         );
     }
     host.options.proxy.clone_from(&proxy_name);
+    let mut signals = Signals::new()?;
     let mut errors = Vec::new();
     let routes = attempt_routes(&host, &mut rand::rng());
     let probe_direct = routes.len() > 1;
     for gateway in routes {
         let mut attempt = host.clone();
-        let result = async {
+        // A signal (e.g. OpenSSH giving up) drops the attempt, which kills
+        // resolve_command, hook, proxy_command, or gateway processes.
+        let work = async {
             prepare(&mut attempt, &gateway).await?;
             hooks::invoke(
                 &attempt.options,
@@ -783,23 +854,28 @@ pub async fn connect_with(
                 probe_direct,
             )
             .await
-        }
-        .await;
+        };
+        let result = match signals.guard("transport setup", work).await {
+            Err(error) if error.is::<Interrupted>() => {
+                return Err(error.context(format!("connect {target}")));
+            }
+            result => result,
+        };
         match result {
             Ok(mut connection) => {
-                let stats = relay(&mut connection, &attempt).await?;
+                let stats = relay(&mut connection, &attempt, &mut signals).await?;
                 tracing::debug!(?stats, "connection closed");
                 return Ok(());
             }
             Err(error) => {
                 // A failing notification must not prevent the remaining routes.
-                if let Err(hook_error) = hooks::invoke(
-                    &attempt.options,
-                    Event::OnConnectError,
-                    &json!({"host": attempt, "gateway": gateway, "error": format!("{error:#}")}),
-                )
-                .await
-                {
+                let context =
+                    json!({"host": attempt, "gateway": gateway, "error": format!("{error:#}")});
+                let hook = hooks::invoke(&attempt.options, Event::OnConnectError, &context);
+                if let Err(hook_error) = signals.guard("on_connect_error hooks", hook).await {
+                    if hook_error.is::<Interrupted>() {
+                        return Err(hook_error);
+                    }
                     tracing::error!(%gateway, error = %format!("{hook_error:#}"), "connect error hook failed");
                 }
                 tracing::warn!(%gateway, error = %format!("{error:#}"), "route failed");

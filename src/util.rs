@@ -50,6 +50,11 @@ pub fn env_references(input: &str) -> impl Iterator<Item = String> + '_ {
         .map(|captures| captures[1].to_owned())
 }
 
+/// Removes every `${NAME}` reference from `input`.
+pub fn strip_env_references(input: &str) -> String {
+    ENV_PATTERN.replace_all(input, "").into_owned()
+}
+
 /// Formats bytes as lowercase hexadecimal.
 pub fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;

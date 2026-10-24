@@ -11,13 +11,16 @@ use sha1::{Digest, Sha1};
 use std::{
     collections::{BTreeSet, HashMap},
     fmt::Write,
+    sync::LazyLock,
 };
 
 /// Maximum depth of nested gateway routes (shared by validation, topology,
 /// and the runtime cycle guard).
 pub const MAX_GATEWAY_DEPTH: usize = 32;
 
-/// Maximum number of distinct targets reachable through gateway expansion.
+/// Maximum number of distinct materialized targets: cached names and gateway
+/// or chain components that are not configured host names or literal aliases.
+/// Configured names are bounded by the configuration itself and never count.
 pub const MAX_ROUTE_TARGETS: usize = 4096;
 
 /// Returns whether `name` is a glob or `regex:` pattern rather than a literal.
@@ -94,6 +97,8 @@ struct Entry<'a> {
     name: &'a str,
     options: Host,
     rules: Vec<Rule<'a>>,
+    /// The hostname needs regex captures, so literal names are not hosts.
+    captures_only: bool,
 }
 
 /// An immutable configuration view for repeated host and route lookups.
@@ -151,10 +156,15 @@ impl<'a> Resolver<'a> {
             }
             let options = inheritance.host(&format!("host:{name}"))?;
             options.validate_gateway_strategy()?;
+            let captures_only = match &options.hostname {
+                Some(hostname) => validate_captures(name, hostname, &rules)?,
+                None => false,
+            };
             entries.push(Entry {
                 name,
                 options,
                 rules,
+                captures_only,
             });
         }
         Ok(Self {
@@ -277,6 +287,63 @@ impl ResolvedHost {
     }
 }
 
+/// Matches `{0}`, `{1}`, ... and `{name}` capture placeholders.
+static CAPTURE_PLACEHOLDER: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\{([0-9]+|[A-Za-z_][A-Za-z0-9_]*)\}").expect("valid placeholder pattern")
+});
+
+/// Validates capture placeholders in a host's hostname and returns whether
+/// there are any.
+///
+/// Placeholders need at least one `regex:` rule, and every regex rule must
+/// define each of them. Glob rules cannot substitute captures. Literal names
+/// of such an entry only label the regex rule and are never rendered as hosts.
+/// Other braces are rejected because OpenSSH configuration cannot express them.
+fn validate_captures(name: &str, hostname: &str, rules: &[Rule<'_>]) -> Result<bool> {
+    let hostname = util::strip_env_references(hostname);
+    let placeholders: Vec<&str> = CAPTURE_PLACEHOLDER
+        .captures_iter(&hostname)
+        .filter_map(|captures| captures.get(1).map(|m| m.as_str()))
+        .collect();
+    ensure!(
+        !CAPTURE_PLACEHOLDER
+            .replace_all(&hostname, "")
+            .contains(['{', '}']),
+        "{name}: hostname contains an unmatched brace"
+    );
+    if placeholders.is_empty() {
+        return Ok(false);
+    }
+    ensure!(
+        rules
+            .iter()
+            .any(|rule| matches!(rule.pattern, CompiledPattern::Regex(_))),
+        "{name}: hostname capture placeholders require a regex: host key or alias"
+    );
+    for rule in rules {
+        let pattern = match &rule.pattern {
+            CompiledPattern::Regex(pattern) => pattern,
+            CompiledPattern::Literal => continue,
+            CompiledPattern::Glob(_) => bail!(
+                "{name}: glob {:?} cannot fill hostname capture placeholders; use a regex: pattern",
+                rule.name
+            ),
+        };
+        for placeholder in &placeholders {
+            let defined = match placeholder.parse::<usize>() {
+                Ok(index) => index < pattern.captures_len(),
+                Err(_) => pattern.capture_names().flatten().any(|n| n == *placeholder),
+            };
+            ensure!(
+                defined,
+                "{name}: hostname placeholder {{{placeholder}}} is not a capture group of {:?}",
+                rule.name
+            );
+        }
+    }
+    Ok(true)
+}
+
 /// Replaces `{0}`, `{1}`, ... and `{name}` in `hostname` with regex captures.
 fn substitute_captures(hostname: &mut String, re: &regex::Regex, name: &str) {
     let Some(captures) = re.captures(name) else {
@@ -319,7 +386,14 @@ impl<'a> Resolver<'a> {
     /// Validates and resolves a user-supplied target.
     pub fn resolve(&self, target: &str) -> Result<ResolvedHost> {
         util::valid_target(target)?;
-        self.resolve_inner(target)
+        let host = self.resolve_inner(target)?;
+        ensure!(
+            !host.hostname.contains(['{', '}']),
+            "{target}: hostname {:?} has unfilled capture placeholders; \
+             use a name matching the entry's regex: pattern",
+            host.hostname
+        );
+        Ok(host)
     }
 
     /// Returns matching entries in layering order: the exact host key, then a
@@ -389,6 +463,7 @@ impl<'a> Resolver<'a> {
         let hostname = hostname.replace("%n", name).replace("%h", name);
         let hostname = util::expand_env(&hostname)?;
         util::single_line(&hostname)?;
+
         ensure!(
             !hostname.is_empty()
                 && !hostname.chars().any(char::is_whitespace)
@@ -472,23 +547,49 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
+    /// Literal host names and aliases that get their own stanza (patterns and
+    /// names that only label a regex rule with capture placeholders excluded).
+    pub fn concrete_names(&self) -> BTreeSet<String> {
+        self.entries
+            .iter()
+            .filter(|entry| !entry.captures_only)
+            .flat_map(|entry| &entry.rules)
+            .filter(|rule| matches!(rule.pattern, CompiledPattern::Literal))
+            .map(|rule| rule.name.to_owned())
+            .collect()
+    }
+
+    /// Returns whether `name` is a literal `[hosts]` key or literal alias.
+    pub fn is_configured_name(&self, name: &str) -> bool {
+        (!is_pattern(name) && self.config.document.hosts.contains_key(name))
+            || self.aliases.contains_key(name)
+    }
+
     /// Expands targets with every gateway and chain component they can route
     /// through, so each one gets a generated stanza.
+    ///
+    /// At most [`MAX_ROUTE_TARGETS`] of the results may be materialized names;
+    /// configured names are not limited.
     pub fn route_targets(
         &self,
         targets: impl IntoIterator<Item = String>,
     ) -> Result<BTreeSet<String>> {
         let mut pending: Vec<_> = targets.into_iter().collect();
         let mut visited = BTreeSet::new();
+        let mut materialized = 0usize;
         while let Some(target) = pending.pop() {
             util::valid_target(&target)?;
             if !visited.insert(target.clone()) {
                 continue;
             }
-            ensure!(
-                visited.len() <= MAX_ROUTE_TARGETS,
-                "too many expanded gateway targets (limit {MAX_ROUTE_TARGETS})"
-            );
+            if !self.is_configured_name(&target) {
+                materialized += 1;
+                ensure!(
+                    materialized <= MAX_ROUTE_TARGETS,
+                    "too many materialized targets (limit {MAX_ROUTE_TARGETS}); \
+                     configured host names and aliases are not counted"
+                );
+            }
             if let Some((first, rest)) = target.split_once('/') {
                 pending.push(first.into());
                 pending.push(rest.into());
@@ -512,8 +613,7 @@ impl Config {
 
     /// Resolves a user-supplied target; use [`Config::resolver`] for repeated lookups.
     pub fn resolve(&self, target: &str) -> Result<ResolvedHost> {
-        util::valid_target(target)?;
-        self.resolver()?.resolve_inner(target)
+        self.resolver()?.resolve(target)
     }
 
     /// Resolves a `[hosts]` key exactly as written, including pattern keys.
@@ -527,7 +627,13 @@ impl Config {
     }
 
     /// Literal host names and aliases (patterns excluded).
+    ///
+    /// Names that only label a regex rule with capture placeholders are
+    /// excluded as well; see [`Resolver::concrete_names`].
     pub fn concrete_names(&self) -> BTreeSet<String> {
+        if let Ok(resolver) = self.resolver() {
+            return resolver.concrete_names();
+        }
         self.document
             .hosts
             .iter()

@@ -111,7 +111,8 @@ to combine generated and hand-written configuration.
 The wrapper replaces itself with the selected program, so signals and exit
 statuses (including termination by a signal) reach the caller unchanged. Set
 `settings.scp_binary`, `settings.sftp_binary`, or `settings.rsync_binary` to use
-other clients; SSH uses `settings.ssh_binary`.
+other clients; SSH uses `settings.ssh_binary`. SCP and SFTP also receive
+`-S <ssh_binary>` so they start the same SSH client, unless you pass `-S` yourself.
 
 Arguments after the program name belong to that program: SSH uses `-p` for a
 port, while SCP/SFTP use `-P`. Put sshweave options before `wrapper`, for example
@@ -245,7 +246,10 @@ LocalForward = ["8080 localhost:80", "9090 localhost:90"]
   defaults; templates are not directly connectable hosts.
 - Globs support `*`, `?`, and character sets. Regexes require an explicit
   `regex:` prefix and must match the entire name. A regex hostname can use
-  `{1}`, `{2}`, and `{named_capture}` substitutions.
+  `{1}`, `{2}`, and `{named_capture}` substitutions. Every placeholder must be a
+  capture group of each regex key or alias of that host; globs cannot fill them.
+  A literal key of such a host only names the rule: it is not generated as a
+  host, and connecting to it is an error. Other braces are rejected.
 - `aliases` are not inherited. Without `hostname`, a literal alias points to
   the host's configured name; a pattern rule uses the requested name.
 - Lists replace rather than append: a child's `ssh.IdentityFile` replaces the
@@ -421,7 +425,10 @@ Six events are available: `before_connect`, `on_connect`, `on_connect_error`,
 `on_disconnect`, `before_config_write`, and `after_config_write`.
 Put connection events in hosts/templates/defaults and configuration-write events
 in defaults. Write events run only when generated content changes. Hooks within
-an event run in order; failures are reported.
+an event run in order. A failing hook fails the operation, unless it sets
+`on_error = "warn"` (the default for `notify`), which logs the failure and
+continues. `exec` and `notify` hooks are killed after `timeout` seconds
+(default 60; `0` disables the limit).
 
 ```toml
 [defaults.hooks]
@@ -441,12 +448,12 @@ on_disconnect = [
 ]
 ```
 
-| Driver | Field   | Behavior                                    |
-| ------ | ------- | ------------------------------------------- |
-| write  | message | Print a message to stderr                   |
-| exec   | command | Run a shell command and wait for completion |
-| daemon | command | Run a command in the background             |
-| notify | message | Send a desktop notification                 |
+| Driver | Fields                     | Behavior                                    |
+| ------ | -------------------------- | ------------------------------------------- |
+| write  | message, on_error          | Print a message to stderr                   |
+| exec   | command, timeout, on_error | Run a shell command and wait for completion |
+| daemon | command, on_error          | Run a command in the background             |
+| notify | message, timeout, on_error | Send a desktop notification                 |
 
 Templates use Jinja-style syntax; undefined variables are errors. Available
 values depend on the event: `host`, `gateway`, `stats`, and `error`.
@@ -460,6 +467,9 @@ A `notify` hook for that event is titled `sshweave: transport established`.
 `on_disconnect` runs when the transport closes, not when each multiplexed SSH
 session ends. This includes OpenSSH stopping its ProxyCommand with SIGHUP when
 the client exits; SIGTERM and SIGINT also run the hook, with an `error` value.
+A further signal while hooks run stops them and kills their commands. A signal
+before the transport is established stops the attempt and kills its
+`resolve_command`, `proxy_command`, or gateway processes.
 
 exec/daemon also receive the JSON environment variable `SSHWEAVE_CONTEXT`.
 When inserting text into shell templates, use `{{ host.name | shellquote }}` or
@@ -470,7 +480,7 @@ Configuration is **trusted executable input**; do not load untrusted TOML/hooks.
 
 | Task                                                | Command                                           |
 | --------------------------------------------------- | ------------------------------------------------- |
-| Validate a chosen configuration                     | `sshweave -c ./sshweave.toml config check`        |
+| Validate and test-render a chosen configuration     | `sshweave -c ./sshweave.toml config check`        |
 | Print generated OpenSSH configuration               | `sshweave config build`                           |
 | Update the managed configuration file               | `sshweave config build --write`                   |
 | Generate configuration without automatic updates    | `sshweave config build --no-automatic-rewrite`    |
@@ -494,11 +504,17 @@ Global options: `--config`/`-c`, `--verbose`/`-v`, and `--debug`.
 Use `sshweave <command> --help` for available options, except wrapper help,
 which uses `sshweave help wrapper`.
 
+`--version` reports the source commit and its date, with a `-modified` suffix when
+the compiled sources differ from that commit. Builds without a Git checkout use
+the packaged commit; packagers can set `SSHWEAVE_BUILD_COMMIT` and
+`SSHWEAVE_BUILD_DATE`, and `SOURCE_DATE_EPOCH` otherwise supplies the date.
+
 `ping` times a TCP handshake to the first hop of the selected route: the
 proxy, or the outermost gateway. It does not start `proxy_command`, authenticate,
 or dial past that hop. `random` routes are probed in configuration order. `-p`
 overrides the port only when the probe is the destination itself. It defaults to
-4 probes; `--count 0` runs until Ctrl+C. No successful probes means a failure exit
+4 probes; `--count 0` runs until Ctrl+C and needs `--interval` of at least 0.2
+seconds. No successful probes means a failure exit
 status. `doctor` prints the Include line and `GIT_SSH_COMMAND`; an Include placed
 after a `Host` or `Match` block is an error. Without `settings.binary`, the
 generated ProxyCommand uses the path of the sshweave executable that last wrote
@@ -565,6 +581,8 @@ names whose pattern was removed or plain names cached by older versions. Preview
 with `--dry-run`.
 OpenSSH host keys, source TOML, private keys, and control sockets are not changed.
 
-Generated configuration supports up to 4096 distinct targets, including configured
-names, aliases, cached targets, and gateway-chain components. Remove unused cached
-names if they cause this limit to be reached.
+Generated configuration supports up to 4096 materialized targets: cached names and
+gateway or chain components that are not configured host names or literal aliases.
+Configured names never count toward this limit. `config check` renders the
+configuration, so it reports this limit as well. Remove unused cached names, or
+run `sshweave cache prune`, if the limit is reached.

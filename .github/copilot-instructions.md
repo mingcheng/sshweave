@@ -73,7 +73,10 @@ and [sample configuration](../examples/sshweave.toml). Chinese counterparts are
 - `on_connect` means transport establishment, not successful SSH authentication.
   `on_disconnect` follows the proxy stream, not each multiplexed SSH session.
   Runtime transport changes must preserve the destination-first-byte probe and
-  bidirectional streaming with half-close support.
+  bidirectional streaming with half-close support. `connect` handles SIGHUP,
+  SIGTERM, and SIGINT for its whole lifetime, so any new long wait must go
+  through `Signals::guard` (or select on `Signals::recv`) and rely on
+  `kill_on_drop` for child processes. Hooks have `on_error` and `timeout`.
 - Preserve nested-route safeguards: `SSHWEAVE_ROUTE_STACK` detects cycles (and
   marks nested hops, which skip registry and configuration rewrites),
   `SSHWEAVE_ROUTE_PROXY` forces the outermost proxy, and gateway recursion is

@@ -95,7 +95,7 @@ pub fn remember_with(resolver: &Resolver<'_>, targets: &[String]) -> Result<()> 
     let original = known.len();
     known.extend(additions);
     if known.len() != original {
-        let mut all = config.concrete_names();
+        let mut all = resolver.concrete_names();
         all.extend(known.iter().cloned());
         resolver.route_targets(all).context(
             "registry update would make the generated target set invalid; \

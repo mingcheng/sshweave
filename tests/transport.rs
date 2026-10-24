@@ -1283,6 +1283,15 @@ async fn ping_reports_success_and_failure_with_correct_exit_codes() -> Result<()
         .await?;
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("100.0% loss"));
+    let output = binary()
+        .arg("-c")
+        .arg(&path)
+        .args(["ping", "--count", "0", "--interval", "0", "test"])
+        .output()
+        .await?;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr)?.contains("--count 0 requires --interval"));
     Ok(())
 }
 
@@ -1873,5 +1882,229 @@ async fn rendering_inputs_include_referenced_environment_variables() -> Result<(
         assert!(output.status.success(), "{stderr}");
         assert!(stderr.contains(expected), "{region}: {stderr}");
     }
+    Ok(())
+}
+
+/// Returns whether a process with `pid` still exists.
+#[cfg(unix)]
+async fn process_alive(pid: &str) -> Result<bool> {
+    Ok(Command::new("kill")
+        .args(["-0", pid])
+        .stderr(Stdio::null())
+        .status()
+        .await?
+        .success())
+}
+
+/// Waits until `path` holds a process ID written by a test helper.
+#[cfg(unix)]
+async fn wait_for_pid(path: &std::path::Path) -> Result<String> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(pid) = fs::read_to_string(path)
+                && !pid.trim().is_empty()
+            {
+                return pid.trim().to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("helper did not record its PID")
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hook_timeouts_and_warn_policy_bound_slow_or_failing_hooks() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await?;
+        socket.write_all(b"banner").await?;
+        socket.shutdown().await?;
+        Ok::<_, std::io::Error>(())
+    });
+    let run = |hooks: &str| {
+        let (dir, path) = fixture(&format!(
+            "[hosts.test]\nhostname='127.0.0.1'\nport={port}\n[hosts.test.hooks]\n{hooks}"
+        ))
+        .expect("fixture");
+        let mut command = binary();
+        command
+            .arg("-c")
+            .arg(&path)
+            .args(["connect", "--no-rewrite", "test"])
+            .stdin(Stdio::null());
+        (dir, command)
+    };
+    let (_dir, mut command) =
+        run("before_connect=[{driver='exec', command='sleep 10', timeout=1}]\n");
+    let started = Instant::now();
+    let output = timeout(Duration::from_secs(5), command.output()).await??;
+    assert!(!output.status.success());
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert!(String::from_utf8(output.stderr)?.contains("hook timed out after 1s"));
+
+    let (_dir, mut command) = run(
+        "before_connect=[{driver='exec', command='exit 4', on_error='warn'}, \
+         {driver='write', message='still running'}]\n",
+    );
+    let output = timeout(Duration::from_secs(5), command.output()).await??;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(output.stdout, b"banner");
+    assert!(stderr.contains("hook failed; continuing"), "{stderr}");
+    assert!(stderr.contains("still running"), "{stderr}");
+    server.await??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn signals_interrupt_slow_disconnect_hooks_and_kill_their_commands() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await?;
+        socket.write_all(b"banner").await?;
+        let mut data = Vec::new();
+        socket.read_to_end(&mut data).await?;
+        Ok::<_, std::io::Error>(())
+    });
+    let (dir, path) = fixture(&format!(
+        "[hosts.test]\nhostname='127.0.0.1'\nport={port}\n[hosts.test.hooks]\n\
+         on_disconnect=[{{driver='exec', timeout=0, command='echo $$ > hook.pid; exec sleep 30'}}]\n"
+    ))?;
+    let mut child = binary()
+        .current_dir(dir.path())
+        .arg("-c")
+        .arg(&path)
+        .args(["connect", "--no-rewrite", "test"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let _held_stdin = child.stdin.take();
+    let mut stdout = child.stdout.take().context("stdout missing")?;
+    let mut banner = [0; 6];
+    timeout(Duration::from_secs(5), stdout.read_exact(&mut banner)).await??;
+    let pid = child.id().context("pid missing")?.to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-HUP", &pid])
+            .status()
+            .await?
+            .success()
+    );
+    let hook_pid = wait_for_pid(&dir.path().join("hook.pid")).await?;
+    assert!(process_alive(&hook_pid).await?);
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .await?
+            .success()
+    );
+    let status = timeout(Duration::from_secs(5), child.wait()).await??;
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .context("stderr missing")?
+        .read_to_string(&mut stderr)
+        .await?;
+    assert!(!status.success());
+    assert!(
+        stderr.contains("SIGTERM received during on_disconnect hooks"),
+        "{stderr}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!process_alive(&hook_pid).await?, "hook command survived");
+    timeout(Duration::from_secs(5), server).await???;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn signals_during_transport_setup_kill_transport_processes() -> Result<()> {
+    let (dir, path) = fixture(
+        "[hosts.test]\nhostname='127.0.0.1'\nconnect_timeout=0\n\
+         proxy_command=['sh', '-c', 'echo $$ > proxy.pid; exec sleep 30']\n",
+    )?;
+    let mut child = binary()
+        .current_dir(dir.path())
+        .arg("-c")
+        .arg(&path)
+        .args(["connect", "--no-rewrite", "test"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let proxy_pid = wait_for_pid(&dir.path().join("proxy.pid")).await?;
+    let pid = child.id().context("pid missing")?.to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-HUP", &pid])
+            .status()
+            .await?
+            .success()
+    );
+    let status = timeout(Duration::from_secs(5), child.wait()).await??;
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .context("stderr missing")?
+        .read_to_string(&mut stderr)
+        .await?;
+    assert!(!status.success());
+    assert!(
+        stderr.contains("SIGHUP received during transport setup"),
+        "{stderr}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!process_alive(&proxy_pid).await?, "proxy_command survived");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scp_and_sftp_wrappers_use_the_configured_ssh_binary() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let client = directory.path().join("client");
+    executable(&client, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n")?;
+    let ssh = directory.path().join("custom-ssh");
+    let path = directory.path().join("config.toml");
+    fs::write(
+        &path,
+        format!(
+            "[settings]\noutput='generated.conf'\nknown_hosts='known.json'\nssh_binary='{}'\n\
+             scp_binary='{client}'\nsftp_binary='{client}'\n",
+            ssh.display(),
+            client = client.display()
+        ),
+    )?;
+    let run = |args: &[&str]| {
+        let mut command = binary();
+        command.arg("-c").arg(&path).arg("wrapper").args(args);
+        command
+    };
+    for args in [&["scp", "file", "db:/tmp/"][..], &["sftp", "db"][..]] {
+        let output = timeout(Duration::from_secs(5), run(args).output()).await??;
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(
+            stdout.contains(&format!("-S\n{}\n", ssh.display())),
+            "{args:?}: {stdout}"
+        );
+    }
+    let output = timeout(
+        Duration::from_secs(5),
+        run(&["scp", "-S", "/usr/bin/other", "file", "db:/tmp/"]).output(),
+    )
+    .await??;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(!stdout.contains(&ssh.display().to_string()), "{stdout}");
+    assert!(stdout.contains("-S\n/usr/bin/other\n"), "{stdout}");
     Ok(())
 }

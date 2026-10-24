@@ -108,6 +108,8 @@ wrapper 通过 `-F` 使用生成文件，而不是通常的 `~/.ssh/config`。
 wrapper 会以所选程序替换自身进程，因此信号与退出状态（包括被信号终止）
 会原样传给调用方。可通过 `settings.scp_binary`、`settings.sftp_binary`、
 `settings.rsync_binary` 指定其他客户端；SSH 使用 `settings.ssh_binary`。
+SCP 与 SFTP 还会收到 `-S <ssh_binary>`，以便启动同一个 SSH 客户端；
+若自行传入 `-S`，则以你的设置为准。
 
 程序名后的参数属于该程序：SSH 端口使用 `-p`，SCP/SFTP 使用 `-P`。
 sshweave 自身的选项放在 `wrapper` 之前，例如
@@ -233,6 +235,9 @@ LocalForward = ["8080 localhost:80", "9090 localhost:90"]
   后续规则只补充尚未设置的字段。未列出的名称仍应用默认值，模板不能作为主机直接连接。
 - glob 使用 `*`、`?` 和字符集合；正则使用显式 `regex:` 前缀，要求整个名字匹配。
   regex 的 hostname 可以使用 `{1}`、`{2}` 和 `{named_capture}`。
+  每个占位符都必须是该主机每个 regex 键或别名的捕获组；glob 无法填充占位符。
+  这类主机的字面键名只用于命名规则，不会生成为主机，直接连接它会报错。
+  其他花括号会被拒绝。
 - `aliases` 不继承。省略 `hostname` 时，字面别名指向配置中的主机名称，
   模式规则则使用请求的名称。
 - 列表整体覆盖，不自动追加；例如子级的 `ssh.IdentityFile` 替换父级列表。
@@ -395,7 +400,10 @@ defaults 中的值分别应用于每条连接，不是全局配额。
 六类事件：`before_connect`、`on_connect`、`on_connect_error`、`on_disconnect`、
 `before_config_write`、`after_config_write`。
 连接事件配置在主机、模板或 defaults 中，配置写入事件放在 defaults 中。
-只有生成内容发生变化时才触发写入事件；同一事件的 hooks 按顺序执行，失败会报告。
+只有生成内容发生变化时才触发写入事件；同一事件的 hooks 按顺序执行。
+hook 失败会使该操作失败，除非设置 `on_error = "warn"`（`notify` 的默认值），
+此时只记录日志并继续。`exec` 与 `notify` 超过 `timeout` 秒（默认 60，
+`0` 表示不限时）会被终止。
 
 ```toml
 [defaults.hooks]
@@ -415,12 +423,12 @@ on_disconnect = [
 ]
 ```
 
-| driver | 字段    | 行为                      |
-| ------ | ------- | ------------------------- |
-| write  | message | 向 stderr 输出消息        |
-| exec   | command | 执行 shell 命令并等待完成 |
-| daemon | command | 在后台执行命令            |
-| notify | message | 发送桌面通知              |
+| driver | 字段                       | 行为                      |
+| ------ | -------------------------- | ------------------------- |
+| write  | message, on_error          | 向 stderr 输出消息        |
+| exec   | command, timeout, on_error | 执行 shell 命令并等待完成 |
+| daemon | command, on_error          | 在后台执行命令            |
+| notify | message, timeout, on_error | 发送桌面通知              |
 
 模板使用 Jinja 风格语法，未定义变量会报错。
 可用变量随事件而定，包括 `host`、`gateway`、`stats` 和 `error`。
@@ -433,6 +441,8 @@ stats 包含 `sent_bytes`、`received_bytes`、`duration_seconds`、
 `on_disconnect` 在传输连接关闭时触发，而不是在每个复用的 SSH 会话结束时触发。
 OpenSSH 客户端退出时会用 SIGHUP 结束 ProxyCommand，此时同样触发；
 SIGTERM 和 SIGINT 也会触发该 hook，并带有 `error` 值。
+hook 运行期间再次收到信号会中止 hook 并终止其命令。传输建立之前收到信号会
+中止本次尝试，并终止对应的 `resolve_command`、`proxy_command` 或网关进程。
 
 exec/daemon 还会获得 JSON 环境变量 `SSHWEAVE_CONTEXT`。若在 shell 模板中插入
 文本，请使用 `{{ host.name | shellquote }}`，或从 JSON 环境变量读取。
@@ -442,7 +452,7 @@ exec/daemon 还会获得 JSON 环境变量 `SSHWEAVE_CONTEXT`。若在 shell 模
 
 | 用途                                | 命令                                              |
 | ----------------------------------- | ------------------------------------------------- |
-| 验证指定配置                        | `sshweave -c ./sshweave.toml config check`        |
+| 验证并试渲染指定配置                | `sshweave -c ./sshweave.toml config check`        |
 | 输出生成的 OpenSSH 配置             | `sshweave config build`                           |
 | 更新受管理的配置文件                | `sshweave config build --write`                   |
 | 生成不自动更新的配置                | `sshweave config build --no-automatic-rewrite`    |
@@ -466,10 +476,15 @@ exec/daemon 还会获得 JSON 环境变量 `SSHWEAVE_CONTEXT`。若在 shell 模
 通过 `sshweave <command> --help` 查看选项；wrapper 例外，
 需使用 `sshweave help wrapper`。
 
+`--version` 显示源码提交及其日期；编译所用源码与该提交不一致时追加 `-modified`。
+没有 Git 工作区的构建使用打包时记录的提交；打包者可设置 `SSHWEAVE_BUILD_COMMIT`
+和 `SSHWEAVE_BUILD_DATE`，否则由 `SOURCE_DATE_EPOCH` 提供日期。
+
 `ping` 对所选路线的第一跳做 TCP 握手计时：代理，或最外层跳板。
 它不启动 `proxy_command`，不认证，也不继续拨后面的跳。`random` 按配置顺序探测。
 `-p` 只在探测目标本身时覆盖端口。默认探测 4 次，
-`--count 0` 持续运行至 Ctrl+C；没有成功探测时返回失败状态。
+`--count 0` 持续运行至 Ctrl+C，此时 `--interval` 不得小于 0.2 秒；
+没有成功探测时返回失败状态。
 `doctor` 打印 Include 行和 `GIT_SSH_COMMAND`；Include 写在 `Host` 或 `Match` 之后会报错。
 未设置 `settings.binary` 时，生成的 ProxyCommand 使用最近一次写入它的 sshweave
 可执行文件路径；`doctor` 会报告不一致。从多个位置运行 sshweave 会导致它们轮流
@@ -529,5 +544,7 @@ sshweave config build --write
 已有名称不会自动淘汰；`sshweave cache prune` 可删除不再需要独立配置段的名称，
 例如对应模式已删除的名称，或旧版本缓存的普通名称，可先用 `--dry-run` 预览。OpenSSH 主机密钥、源 TOML、私钥和控制套接字均不会修改。
 
-生成配置最多支持 4096 个不同目标，包含静态名称、别名、缓存目标及网关链组件。
-若旧缓存导致达到上限，可删除不再使用的名称。
+生成配置最多支持 4096 个实例化目标：即不属于已配置主机名或字面别名的缓存名称，
+以及网关、链式组件。已配置的名称不计入上限。`config check` 会实际渲染配置，
+因此同样会报告该上限。达到上限时，可删除不再使用的缓存名称或运行
+`sshweave cache prune`。

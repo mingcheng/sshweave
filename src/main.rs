@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde_json::json;
 use sshweave::{
-    config::{Config, Host},
+    config::{Config, Host, InheritanceLayer},
     render,
     resolver::is_pattern,
     runtime, sockets, store, topology, util,
@@ -230,7 +230,7 @@ struct PingArgs {
     /// Override the port when the probe is the destination itself.
     #[arg(long, short = 'p', value_parser = port_parser())]
     port: Option<u16>,
-    /// Number of probes; 0 runs until interrupted.
+    /// Number of probes; 0 runs until interrupted (needs an interval of at least 0.2s).
     #[arg(long, short = 'n', default_value_t = 4)]
     count: u32,
     /// Seconds between probes.
@@ -254,7 +254,7 @@ fn print_json(value: &impl serde::Serialize) -> Result<()> {
 /// Resolves every concrete and materialized host.
 fn expanded(config: &Config) -> Result<serde_json::Value> {
     let resolver = config.resolver()?;
-    let mut names = config.concrete_names();
+    let mut names = resolver.concrete_names();
     names.extend(store::known_hosts(config)?);
     let hosts = names
         .iter()
@@ -354,12 +354,22 @@ async fn config_command(config: &Config, command: ConfigCommand) -> Result<()> {
                     .write_all(render::ssh_config(config, &known, automatic)?.as_bytes())?;
             }
         }
-        ConfigCommand::Check => println!(
-            "Configuration valid ({} hosts, {} templates, {} files)",
-            config.document.hosts.len(),
-            config.document.templates.len(),
-            config.files.len()
-        ),
+        ConfigCommand::Check => {
+            // Rendering catches errors that only appear for concrete and
+            // cached targets, so a passing check means build and connect work.
+            render::ssh_config(
+                config,
+                &store::known_hosts(config)?,
+                config.document.settings.automatic_rewrite,
+            )
+            .context("generated configuration")?;
+            println!(
+                "Configuration valid ({} hosts, {} templates, {} files)",
+                config.document.hosts.len(),
+                config.document.templates.len(),
+                config.files.len()
+            );
+        }
         ConfigCommand::Json { expand: true } | ConfigCommand::List { json: true } => {
             print_json(&expanded(config)?)?;
         }
@@ -425,28 +435,11 @@ async fn config_command(config: &Config, command: ConfigCommand) -> Result<()> {
     Ok(())
 }
 
-struct ExplainLayer<'a> {
-    label: String,
-    host: &'a Host,
-}
-
 fn explain(config: &Config, target: &str) -> Result<()> {
     let resolver = config.resolver()?;
     let resolved = resolver.resolve(target)?;
     let matched = resolver.matched_entries(target);
-    let mut layers = Vec::new();
-    let mut stack = Vec::new();
-    let mut seen = BTreeSet::new();
-    for entry in &matched {
-        explain_walk(
-            config,
-            &format!("host:{entry}"),
-            &mut layers,
-            &mut stack,
-            &mut seen,
-        )?;
-    }
-    explain_defaults(config, &mut layers, &mut stack, &mut seen)?;
+    let layers = config.inheritance_layers(&matched)?;
     println!("{} -> {}", resolved.name, resolved.prototype());
     if matched.is_empty() {
         println!("matched: no host entry");
@@ -530,73 +523,11 @@ fn explain(config: &Config, target: &str) -> Result<()> {
     Ok(())
 }
 
-fn explain_defaults<'a>(
-    config: &'a Config,
-    layers: &mut Vec<ExplainLayer<'a>>,
-    stack: &mut Vec<String>,
-    seen: &mut BTreeSet<String>,
-) -> Result<()> {
-    let key = "defaults:".to_owned();
-    ensure!(
-        stack.len() < 64 && !stack.contains(&key),
-        "inheritance cycle/depth limit: {} -> {key}",
-        stack.join(" -> ")
-    );
-    if !seen.insert(key.clone()) {
-        return Ok(());
-    }
-    stack.push(key);
-    layers.push(ExplainLayer {
-        label: "defaults".to_owned(),
-        host: &config.document.defaults,
-    });
-    for parent in &config.document.defaults.inherits {
-        explain_walk(config, parent, layers, stack, seen)?;
-    }
-    stack.pop();
-    Ok(())
-}
-
-fn explain_walk<'a>(
-    config: &'a Config,
-    spec: &str,
-    layers: &mut Vec<ExplainLayer<'a>>,
-    stack: &mut Vec<String>,
-    seen: &mut BTreeSet<String>,
-) -> Result<()> {
-    let (kind, name) = match spec.split_once(':') {
-        Some((kind @ ("host" | "template"), rest)) => (kind, rest),
-        _ if config.document.templates.contains_key(spec) => ("template", spec),
-        _ => ("host", spec),
-    };
-    let key = format!("{kind}:{name}");
-    ensure!(
-        stack.len() < 64 && !stack.contains(&key),
-        "inheritance cycle/depth limit: {} -> {key}",
-        stack.join(" -> ")
-    );
-    if !seen.insert(key.clone()) {
-        return Ok(());
-    }
-    let host = if kind == "template" {
-        config.document.templates.get(name)
-    } else {
-        config.document.hosts.get(name)
-    }
-    .with_context(|| format!("unknown inheritance parent {key}"))?;
-    stack.push(key);
-    layers.push(ExplainLayer {
-        label: format!("{kind} {name}"),
-        host,
-    });
-    for parent in &host.inherits {
-        explain_walk(config, parent, layers, stack, seen)?;
-    }
-    stack.pop();
-    Ok(())
-}
-
-fn report_field(title: &str, layers: &[ExplainLayer<'_>], value: impl Fn(&Host) -> Option<String>) {
+fn report_field(
+    title: &str,
+    layers: &[InheritanceLayer<'_>],
+    value: impl Fn(&Host) -> Option<String>,
+) {
     let mut winner = None;
     let mut hidden = Vec::new();
     for layer in layers {
@@ -929,11 +860,18 @@ fn report_removed(removed: &BTreeSet<String>, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// Smallest interval for unbounded probing, like ping(8) for unprivileged users.
+const MIN_CONTINUOUS_PING_INTERVAL: f64 = 0.2;
+
 /// `sshweave ping`: time a TCP handshake to the first hop of the selected route.
 async fn ping(config: &Config, args: PingArgs) -> Result<()> {
     ensure!(
         args.interval.is_finite() && (0.0..=86400.0).contains(&args.interval),
         "interval must be 0..86400 seconds"
+    );
+    ensure!(
+        args.count != 0 || args.interval >= MIN_CONTINUOUS_PING_INTERVAL,
+        "--count 0 requires --interval of at least {MIN_CONTINUOUS_PING_INTERVAL} seconds"
     );
     let mut probe = topology::tcp_probe(config, &args.target)?;
     if let Some(name) = probe.prepare_host.clone() {
@@ -1064,7 +1002,7 @@ mod tests {
             "target:",
             "compiler:",
             "config:",
-            "license:",
+            "author:",
             "homepage:",
         ] {
             assert!(long.contains(label), "missing {label} in {long}");

@@ -6,6 +6,7 @@ use anyhow::Result;
 use sshweave::{config::Config, render, resolver::MAX_ROUTE_TARGETS, store};
 use std::{
     collections::BTreeSet,
+    fmt::Write,
     fs,
     process::{Command, Output},
     sync::{Arc, Barrier},
@@ -40,11 +41,12 @@ fn cli(config: &Config, args: &[&str]) -> Result<Output> {
 }
 
 #[test]
-fn overflowing_updates_preserve_registry_and_count_configured_routes() -> Result<()> {
+fn overflowing_updates_preserve_registry_and_count_only_materialized_routes() -> Result<()> {
     let (_directory, config) = fixture("[hosts.fixed]\naliases=['alias']\ngateways=['gateway']\n")?;
-    let original = seed(&config, MAX_ROUTE_TARGETS - 3)?;
+    // The unconfigured gateway counts; `fixed` and `alias` do not.
+    let original = seed(&config, MAX_ROUTE_TARGETS - 1)?;
     let error = store::remember(&config, &["extra".into()]).unwrap_err();
-    assert!(format!("{error:#}").contains("too many expanded gateway targets"));
+    assert!(format!("{error:#}").contains("too many materialized targets"));
     assert_eq!(fs::read(config.known_hosts()?)?, original);
     assert!(
         render::ssh_config(&config, &store::known_hosts(&config)?, true)?
@@ -192,5 +194,37 @@ fn prune_keeps_only_targets_that_need_generated_stanzas() -> Result<()> {
             .collect()
     );
     assert!(store::prune(&config, false)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn configured_names_do_not_count_toward_the_target_limit() -> Result<()> {
+    let mut text = String::from("[hosts.bastion]\n");
+    for index in 0..MAX_ROUTE_TARGETS {
+        writeln!(
+            text,
+            "[hosts.h{index}]\naliases=['a{index}']\ngateways=['bastion']"
+        )?;
+    }
+    let (_directory, config) = fixture(&text)?;
+    let generated = render::ssh_config(&config, &BTreeSet::new(), true)?;
+    assert!(generated.contains(&format!("\nHost a{}\n", MAX_ROUTE_TARGETS - 1)));
+    store::remember(&config, &["h1/bastion".into()])?;
+    let check = cli(&config, &["config", "check"])?;
+    assert!(check.status.success(), "{check:?}");
+    Ok(())
+}
+
+#[test]
+fn config_check_renders_and_reports_generation_errors() -> Result<()> {
+    let (_directory, config) = fixture("")?;
+    let healthy = cli(&config, &["config", "check"])?;
+    assert!(healthy.status.success(), "{healthy:?}");
+    seed(&config, MAX_ROUTE_TARGETS + 1)?;
+    let check = cli(&config, &["config", "check"])?;
+    assert!(!check.status.success());
+    let stderr = String::from_utf8(check.stderr)?;
+    assert!(stderr.contains("generated configuration"), "{stderr}");
+    assert!(stderr.contains("too many materialized targets"), "{stderr}");
     Ok(())
 }

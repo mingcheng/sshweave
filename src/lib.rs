@@ -27,6 +27,10 @@
 
 #![forbid(unsafe_code)]
 
+// Signals, process groups, control sockets, and `exec` rely on Unix APIs.
+#[cfg(not(unix))]
+compile_error!("sshweave supports Unix-like systems (macOS and Linux) only");
+
 pub mod config;
 pub mod hooks;
 pub mod proxy;
