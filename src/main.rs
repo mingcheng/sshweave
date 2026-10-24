@@ -7,7 +7,12 @@ mod wrapper;
 use anyhow::{Context, Result, ensure};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde_json::json;
-use sshweave::{config::Config, render, runtime, sockets, store, topology};
+use sshweave::{
+    config::{Config, Host},
+    render,
+    resolver::is_pattern,
+    runtime, sockets, store, topology, util,
+};
 use std::{
     collections::BTreeSet,
     io::{self, Write},
@@ -78,8 +83,10 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// TCP connection latency probe (not ICMP).
+    /// TCP latency of the first hop on the selected route (not ICMP).
     Ping(PingArgs),
+    /// Check OpenSSH integration without connecting.
+    Doctor,
     /// Print SSH route topology without connecting or executing commands.
     Topology {
         target: String,
@@ -114,8 +121,8 @@ enum ConfigCommand {
         #[arg(long)]
         no_automatic_rewrite: bool,
         /// Omit materialized targets from the registry (stdout only).
-        #[arg(long)]
-        ignore_known_hosts: bool,
+        #[arg(long = "ignore-registry", alias = "ignore-known-hosts")]
+        ignore_registry: bool,
     },
     /// Validate TOML, inheritance, options, and gateway graphs.
     Check,
@@ -131,12 +138,14 @@ enum ConfigCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Search host names, aliases, comments, and resolved endpoints.
+    /// Search names, aliases, comments, endpoints, gateways, proxies, and templates.
     Search { query: String },
     /// Export gateway, alias, and inheritance relationships as Graphviz DOT.
     Graphviz,
     /// Resolve a target without executing commands or connecting.
     Resolve { target: String },
+    /// Show which host, template, or defaults supplied each effective field.
+    Explain { target: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -179,7 +188,7 @@ enum SocketCommand {
 #[derive(Args, Debug)]
 struct PingArgs {
     target: String,
-    /// Override the destination port.
+    /// Override the port when the probe is the destination itself.
     #[arg(long, short = 'p', value_parser = port_parser())]
     port: Option<u16>,
     /// Number of probes; 0 runs until interrupted.
@@ -253,6 +262,7 @@ async fn run(cli: Cli) -> Result<i32> {
         }
         Commands::Wrapper { program, args } => return wrapper::run(&load()?, program, args).await,
         Commands::Ping(args) => ping(&load()?, args).await?,
+        Commands::Doctor => return doctor(&load()?).await,
         Commands::Topology { target, ascii } => topology::print(&load()?, &target, ascii)?,
         Commands::Sockets { command } => sockets_command(&load()?, command).await?,
         Commands::Cache { command } => cache_command(&load()?, command)?,
@@ -265,22 +275,38 @@ async fn config_command(config: &Config, command: ConfigCommand) -> Result<()> {
         ConfigCommand::Build {
             write,
             no_automatic_rewrite,
-            ignore_known_hosts,
+            ignore_registry,
         } => {
             ensure!(
-                !(write && ignore_known_hosts),
-                "--ignore-known-hosts cannot be combined with --write"
+                !(write && ignore_registry),
+                "--ignore-registry cannot be combined with --write"
             );
             let automatic = config.document.settings.automatic_rewrite && !no_automatic_rewrite;
             if write {
+                let output = config.output()?;
+                let next = render::ssh_config(config, &store::known_hosts(config)?, automatic)?;
+                if let Ok(current) = std::fs::read_to_string(&output)
+                    && current.starts_with(render::HEADER)
+                    && current != next
+                {
+                    let old_hosts = host_directives(&current);
+                    let new_hosts = host_directives(&next);
+                    for line in old_hosts.difference(&new_hosts) {
+                        eprintln!("- {line}");
+                    }
+                    for line in new_hosts.difference(&old_hosts) {
+                        eprintln!("+ {line}");
+                    }
+                }
                 let changed = store::sync(config, automatic).await?;
                 eprintln!(
                     "{} {}",
                     if changed { "Updated" } else { "Unchanged" },
-                    config.output()?.display()
+                    output.display()
                 );
+                eprintln!("{}", proxy_scope_note(&output)?);
             } else {
-                let known = if ignore_known_hosts {
+                let known = if ignore_registry {
                     BTreeSet::new()
                 } else {
                     store::known_hosts(config)?
@@ -300,13 +326,18 @@ async fn config_command(config: &Config, command: ConfigCommand) -> Result<()> {
         }
         ConfigCommand::Json { expand: false } => print_json(config)?,
         ConfigCommand::Resolve { target } => print_json(&config.resolve(&target)?)?,
+        ConfigCommand::Explain { target } => explain(config, &target)?,
         ConfigCommand::List { json: false } => {
             let resolver = config.resolver()?;
             for name in config.document.hosts.keys() {
                 let host = resolver.entry(name)?;
                 println!("{name} -> {}", host.prototype());
-                if !host.options.aliases.is_empty() {
-                    println!("  aliases: {}", host.options.aliases.join(", "));
+                for alias in &host.options.aliases {
+                    if is_pattern(alias) {
+                        println!("  pattern: {alias}");
+                    } else {
+                        println!("{alias} -> {name}");
+                    }
                 }
                 if !host.gateways.is_empty() {
                     println!("  gateways: {}", host.gateways.join(", "));
@@ -315,6 +346,11 @@ async fn config_command(config: &Config, command: ConfigCommand) -> Result<()> {
                 if let Some(proxy) = &host.options.proxy {
                     println!("  proxy: {proxy}");
                 }
+                if let Some(rate) = &host.options.rate_limit {
+                    println!(
+                        "  rate_limit: {rate} (combined send and receive, this connection only)"
+                    );
+                }
             }
         }
         ConfigCommand::Search { query } => {
@@ -322,11 +358,23 @@ async fn config_command(config: &Config, command: ConfigCommand) -> Result<()> {
             let resolver = config.resolver()?;
             for (name, raw) in &config.document.hosts {
                 let host = resolver.entry(name)?;
+                let proxy_url = host
+                    .options
+                    .proxy
+                    .as_ref()
+                    .and_then(|name| config.document.proxies.get(name))
+                    .map(|proxy| proxy.url.as_str())
+                    .unwrap_or("");
                 let haystack = format!(
-                    "{name} {} {:?} {:?}",
+                    "{name} {} {} {} {} {} {} {} {} {proxy_url}",
                     host.prototype(),
-                    raw.aliases,
-                    raw.comment
+                    host.hostname,
+                    host.options.aliases.join(" "),
+                    host.options.comment.as_deref().unwrap_or(""),
+                    host.options.proxy.as_deref().unwrap_or(""),
+                    host.gateways.join(" "),
+                    host.gateway_strategy.as_str(),
+                    raw.inherits.join(" "),
                 );
                 if haystack.to_lowercase().contains(&needle) {
                     println!("{name} -> {}", host.prototype());
@@ -338,20 +386,382 @@ async fn config_command(config: &Config, command: ConfigCommand) -> Result<()> {
     Ok(())
 }
 
+struct ExplainLayer<'a> {
+    label: String,
+    host: &'a Host,
+}
+
+fn explain(config: &Config, target: &str) -> Result<()> {
+    let resolved = config.resolve(target)?;
+    let mut layers = Vec::new();
+    let mut stack = Vec::new();
+    let mut seen = BTreeSet::new();
+    if let Some(pattern) = &resolved.pattern {
+        explain_walk(
+            config,
+            &format!("host:{pattern}"),
+            &mut layers,
+            &mut stack,
+            &mut seen,
+        )?;
+    }
+    explain_defaults(config, &mut layers, &mut stack, &mut seen)?;
+    println!("{} -> {}", resolved.name, resolved.prototype());
+    match &resolved.pattern {
+        Some(pattern) => println!("matched: host {pattern}"),
+        None => println!("matched: no host entry"),
+    }
+    if target.contains('/') {
+        println!(
+            "routes: {} (explicit chain overrides configured gateways)",
+            resolved.routes().join(", ")
+        );
+        println!("gateway_strategy: sequential (explicit chain overrides the configured strategy)");
+    } else {
+        println!("routes: {}", resolved.routes().join(", "));
+        println!("gateway_strategy: {}", resolved.gateway_strategy.as_str());
+    }
+    report_field("hostname", &layers, |host| host.hostname.clone());
+    report_field("user", &layers, |host| host.user.clone());
+    report_field("port", &layers, |host| {
+        host.port.map(|port| port.to_string())
+    });
+    report_field("gateways", &layers, |host| {
+        host.gateways.as_ref().map(|items| items.join(", "))
+    });
+    report_field("gateway_strategy", &layers, |host| {
+        host.gateway_strategy
+            .map(|strategy| strategy.as_str().to_owned())
+    });
+    report_field("proxy", &layers, |host| host.proxy.clone());
+    report_field("connect_timeout", &layers, |host| {
+        host.connect_timeout.map(|seconds| seconds.to_string())
+    });
+    report_field("rate_limit", &layers, |host| {
+        host.rate_limit
+            .as_ref()
+            .map(|limit| format!("{limit} (combined send and receive, this connection only)"))
+    });
+    report_field("resolve_command", &layers, |host| {
+        host.resolve_command.as_ref().map(|args| args.join(" "))
+    });
+    report_field("proxy_command", &layers, |host| {
+        host.proxy_command.as_ref().map(|args| args.join(" "))
+    });
+    let mut options = BTreeSet::new();
+    for layer in &layers {
+        options.extend(layer.host.ssh.keys().cloned());
+    }
+    for key in options {
+        report_field(&format!("ssh.{key}"), &layers, |host| {
+            host.ssh_option(&key).map(|value| value.lines().join(", "))
+        });
+    }
+    if !target.contains('/')
+        && resolved.gateway_strategy == sshweave::config::GatewayStrategy::Sequential
+        && layers
+            .iter()
+            .all(|layer| layer.host.gateway_strategy.is_none())
+    {
+        println!("gateway_strategy built-in: sequential");
+    }
+    if layers.iter().all(|layer| layer.host.user.is_none()) {
+        println!("user: {} (built-in $USER)", resolved.user);
+    }
+    if layers.iter().all(|layer| layer.host.port.is_none()) {
+        println!("port: {} (built-in default)", resolved.port);
+    }
+    if !config.files.is_empty() {
+        println!("files:");
+        for file in &config.files {
+            println!("  {}", file.display());
+        }
+    }
+    Ok(())
+}
+
+fn explain_defaults<'a>(
+    config: &'a Config,
+    layers: &mut Vec<ExplainLayer<'a>>,
+    stack: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+) -> Result<()> {
+    let key = "defaults:".to_owned();
+    ensure!(
+        stack.len() < 64 && !stack.contains(&key),
+        "inheritance cycle/depth limit: {} -> {key}",
+        stack.join(" -> ")
+    );
+    if !seen.insert(key.clone()) {
+        return Ok(());
+    }
+    stack.push(key);
+    layers.push(ExplainLayer {
+        label: "defaults".to_owned(),
+        host: &config.document.defaults,
+    });
+    for parent in &config.document.defaults.inherits {
+        explain_walk(config, parent, layers, stack, seen)?;
+    }
+    stack.pop();
+    Ok(())
+}
+
+fn explain_walk<'a>(
+    config: &'a Config,
+    spec: &str,
+    layers: &mut Vec<ExplainLayer<'a>>,
+    stack: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+) -> Result<()> {
+    let (kind, name) = match spec.split_once(':') {
+        Some((kind @ ("host" | "template"), rest)) => (kind, rest),
+        _ if config.document.templates.contains_key(spec) => ("template", spec),
+        _ => ("host", spec),
+    };
+    let key = format!("{kind}:{name}");
+    ensure!(
+        stack.len() < 64 && !stack.contains(&key),
+        "inheritance cycle/depth limit: {} -> {key}",
+        stack.join(" -> ")
+    );
+    if !seen.insert(key.clone()) {
+        return Ok(());
+    }
+    let host = if kind == "template" {
+        config.document.templates.get(name)
+    } else {
+        config.document.hosts.get(name)
+    }
+    .with_context(|| format!("unknown inheritance parent {key}"))?;
+    stack.push(key);
+    layers.push(ExplainLayer {
+        label: format!("{kind} {name}"),
+        host,
+    });
+    for parent in &host.inherits {
+        explain_walk(config, parent, layers, stack, seen)?;
+    }
+    stack.pop();
+    Ok(())
+}
+
+fn report_field(title: &str, layers: &[ExplainLayer<'_>], value: impl Fn(&Host) -> Option<String>) {
+    let mut winner = None;
+    let mut hidden = Vec::new();
+    for layer in layers {
+        if let Some(text) = value(layer.host) {
+            if winner.is_none() {
+                winner = Some((layer.label.clone(), text));
+            } else {
+                hidden.push((layer.label.clone(), text));
+            }
+        }
+    }
+    let Some((source, text)) = winner else {
+        return;
+    };
+    println!("{title}: {text}");
+    println!("  from {source}");
+    for (source, text) in hidden {
+        println!("  hidden {source}: {text}");
+    }
+}
+
 fn info(config: &Config) -> Result<()> {
+    let output = config.output()?;
     print_json(&json!({
         "version": env!("CARGO_PKG_VERSION"),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "executable": std::env::current_exe()?,
         "source": config.source,
-        "output": config.output()?,
-        "known_hosts": config.known_hosts()?,
+        "output": &output,
+        "registry": config.known_hosts()?,
+        "include": include_line(&output)?,
+        "git_ssh_command": git_ssh_command(config, &output)?,
+        "rewrite": "An Include connection updates configuration after OpenSSH has read it, then asks you to retry. `sshweave wrapper ssh` applies changes first.",
         "files": config.files,
         "hosts": config.document.hosts.len(),
         "templates": config.document.templates.len(),
         "proxies": config.document.proxies.len(),
     }))
+}
+
+fn host_directives(text: &str) -> BTreeSet<String> {
+    text.lines()
+        .filter(|line| line.starts_with("Host "))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn include_line(output: &std::path::Path) -> Result<String> {
+    let path = output.to_str().context("output path is not UTF-8")?;
+    Ok(format!("Include {}", shell_words::quote(path)))
+}
+
+fn git_ssh_command(config: &Config, output: &std::path::Path) -> Result<String> {
+    let ssh = config.ssh_binary()?;
+    let ssh = ssh.to_str().context("ssh_binary path is not UTF-8")?;
+    let path = output.to_str().context("output path is not UTF-8")?;
+    Ok(shell_words::join([ssh, "-F", path]))
+}
+
+fn proxy_scope_note(output: &std::path::Path) -> Result<String> {
+    Ok(format!(
+        "Host * ProxyCommand routes every other destination through sshweave. Put `{}` before host-specific ProxyJump or ProxyCommand blocks.",
+        include_line(output)?
+    ))
+}
+
+/// Reports integration problems. Missing Include is informational: the wrapper
+/// workflow does not need it. An Include that follows a Host or Match block is
+/// an error, because OpenSSH keeps the first value it sees.
+async fn doctor(config: &Config) -> Result<i32> {
+    let mut errors = 0u32;
+    let output = config.output()?;
+    let ssh = config.ssh_binary()?;
+    match Command::new(&ssh).arg("-V").output().await {
+        Ok(result) if result.status.success() => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            let version = if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            };
+            println!("ssh: {version}");
+        }
+        Ok(result) => {
+            errors += 1;
+            println!("ssh: {ssh:?} exited with {}", result.status);
+        }
+        Err(error) => {
+            errors += 1;
+            println!("ssh: cannot run {ssh:?}: {error}");
+        }
+    }
+    match std::fs::read_to_string(&output) {
+        Ok(text) if text.starts_with(render::HEADER) => {
+            println!("output: {} (managed)", output.display());
+            let binary = config.binary()?;
+            if !text.contains(binary.to_string_lossy().as_ref()) {
+                errors += 1;
+                println!(
+                    "proxycommand: generated file does not reference {}",
+                    binary.display()
+                );
+            }
+        }
+        Ok(_) => {
+            errors += 1;
+            println!(
+                "output: {} exists but is not a sshweave-managed file",
+                output.display()
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "output: {} (not written; run `sshweave config build --write`)",
+                output.display()
+            );
+        }
+        Err(error) => return Err(error).context("read generated configuration"),
+    }
+    println!("{}", proxy_scope_note(&output)?);
+    let ssh_config = util::expand_path("~/.ssh/config", &std::env::current_dir()?)?;
+    match std::fs::read_to_string(&ssh_config) {
+        Ok(text) => match include_placement(&text, &output)? {
+            IncludePlacement::BeforeHosts => {
+                println!("include: present at the top of {}", ssh_config.display());
+            }
+            IncludePlacement::AfterHost => {
+                errors += 1;
+                println!(
+                    "include: {} matches {} after a Host or Match block. Move it above those blocks so it wins.",
+                    ssh_config.display(),
+                    output.display()
+                );
+            }
+            IncludePlacement::Missing => {
+                println!(
+                    "include: not in {} (optional when using `sshweave wrapper`)",
+                    ssh_config.display()
+                );
+                println!("include: {}", include_line(&output)?);
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "include: {} does not exist (optional when using `sshweave wrapper`)",
+                ssh_config.display()
+            );
+            println!("include: {}", include_line(&output)?);
+        }
+        Err(error) => return Err(error).context("read ~/.ssh/config"),
+    }
+    println!("git: GIT_SSH_COMMAND={}", git_ssh_command(config, &output)?);
+    println!(
+        "rewrite: an Include connection updates configuration after OpenSSH has read it, then asks you to retry. `sshweave wrapper ssh` applies changes first."
+    );
+    Ok(if errors == 0 { 0 } else { 1 })
+}
+
+enum IncludePlacement {
+    BeforeHosts,
+    AfterHost,
+    Missing,
+}
+
+fn include_placement(text: &str, output: &std::path::Path) -> Result<IncludePlacement> {
+    let mut saw_host = false;
+    let mut found = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if include_mentions(trimmed, output)? {
+            found = Some(if saw_host {
+                IncludePlacement::AfterHost
+            } else {
+                IncludePlacement::BeforeHosts
+            });
+            break;
+        }
+        let keyword = trimmed.split_whitespace().next().unwrap_or("");
+        if keyword.eq_ignore_ascii_case("host") || keyword.eq_ignore_ascii_case("match") {
+            saw_host = true;
+        }
+    }
+    Ok(found.unwrap_or(IncludePlacement::Missing))
+}
+
+fn include_mentions(line: &str, output: &std::path::Path) -> Result<bool> {
+    let words = shell_words::split(line)
+        .unwrap_or_else(|_| line.split_whitespace().map(str::to_owned).collect());
+    if !words
+        .first()
+        .is_some_and(|word| word.eq_ignore_ascii_case("include"))
+    {
+        return Ok(false);
+    }
+    let output = output
+        .canonicalize()
+        .unwrap_or_else(|_| output.to_path_buf());
+    let ssh_dir = util::expand_path("~/.ssh", std::path::Path::new("."))?;
+    for word in words.iter().skip(1) {
+        let candidate = if word.starts_with('~') || std::path::Path::new(word).is_absolute() {
+            util::expand_path(word, std::path::Path::new("."))?
+        } else {
+            ssh_dir.join(word)
+        };
+        let candidate = candidate.canonicalize().unwrap_or(candidate);
+        if candidate == output {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `sshweave connect`: refresh the generated configuration if allowed, then relay.
@@ -447,26 +857,27 @@ fn cache_command(config: &Config, command: CacheCommand) -> Result<()> {
     Ok(())
 }
 
-/// `sshweave ping`: measure TCP connect latency to a direct route.
+/// `sshweave ping`: time a TCP handshake to the first hop of the selected route.
 async fn ping(config: &Config, args: PingArgs) -> Result<()> {
     ensure!(
         args.interval.is_finite() && (0.0..=86400.0).contains(&args.interval),
         "interval must be 0..86400 seconds"
     );
-    let mut host = config.resolve(&args.target)?;
-    ensure!(
-        host.gateways.is_empty()
-            && host.options.proxy_command.is_none()
-            && host.options.proxy.is_none(),
-        "ping supports direct TCP routes only"
-    );
-    if let Some(port) = args.port {
-        host.port = port;
+    let mut probe = topology::tcp_probe(config, &args.target)?;
+    if let Some(name) = probe.prepare_host.clone() {
+        let mut host = config.resolve(&name)?;
+        runtime::prepare(&mut host, "").await?;
+        probe.hostname = host.hostname;
+        probe.port = host.port;
     }
-    runtime::prepare(&mut host, "").await?;
+    if probe.honor_port_override
+        && let Some(port) = args.port
+    {
+        probe.port = port;
+    }
     println!(
-        "PING {} ({}), TCP port {}",
-        args.target, host.hostname, host.port
+        "PING {} via {} ({}), TCP port {}",
+        args.target, probe.via, probe.hostname, probe.port
     );
     let mut attempts = 0u32;
     let mut timings = Vec::new();
@@ -479,7 +890,7 @@ async fn ping(config: &Config, args: PingArgs) -> Result<()> {
         }
         let start = Instant::now();
         let connection = tokio::select! {
-            result = runtime::dial(&host.hostname, host.port, args.timeout) => result,
+            result = runtime::dial(&probe.hostname, probe.port, args.timeout) => result,
             result = tokio::signal::ctrl_c() => { result?; break; }
         };
         attempts += 1;

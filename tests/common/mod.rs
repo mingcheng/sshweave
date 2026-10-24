@@ -5,8 +5,9 @@ use std::{path::Path, sync::OnceLock};
 
 /// Returns an empty directory used as `HOME` for the whole test binary.
 ///
-/// Configuration loading always includes `${HOME}/.config/sshweave/conf.d`,
-/// so tests must never see the developer's real home directory.
+/// The default file `~/.config/sshweave/sshweave.toml` implicitly includes
+/// conf.d, and `~` expands against `HOME`. Tests must not see the developer's
+/// real home directory.
 pub(crate) fn isolated_home() -> &'static Path {
     static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
     HOME.get_or_init(|| {

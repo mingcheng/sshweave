@@ -168,8 +168,10 @@ The default file is `~/.config/sshweave/sshweave.toml`. Use `-c` before the
 subcommand or set `SSHWEAVE_CONFIG` to select another file. Relative
 configuration paths resolve from the TOML file's directory.
 
-`~/.config/sshweave/conf.d/*.toml` is always loaded, even with a custom root file;
-the directory may be empty or absent. Use `includes` for other files.
+`~/.config/sshweave/conf.d/*.toml` is loaded automatically only when the root
+file is `~/.config/sshweave/sshweave.toml`. The directory may be empty or absent.
+A file selected with `-c` or `SSHWEAVE_CONFIG` does not load conf.d unless it
+lists that include. Use `includes` for other files.
 Generated configuration and the target cache use the paths below by default.
 Update your OpenSSH Include if you change `settings.output`.
 
@@ -181,7 +183,7 @@ merge them into existing tables; do not duplicate TOML table headers.
 
 [settings]
 output = "~/.config/sshweave/sshweave.conf"
-known_hosts = "~/.config/sshweave/sshweave_known_hosts.json"
+registry = "~/.config/sshweave/sshweave_known_hosts.json"
 ssh_binary = "ssh"
 automatic_rewrite = true
 
@@ -286,14 +288,15 @@ proxy_command = ["nc", "%h", "%p"]
 ## Gateways and failover
 
 Set `gateways` and `gateway_strategy` on hosts, templates, or defaults.
-They are inherited independently. **The default strategy is `random`**;
-use `sequential` explicitly for direct-first or other ordered fallback.
+They are inherited independently. **The default strategy is `sequential`**,
+so candidates are tried in list order. Set `gateway_strategy = "random"` to
+shuffle them on each connection.
 
-| Strategy           | Meaning of `gateways`                                                  | On failure                               |
-| ------------------ | ---------------------------------------------------------------------- | ---------------------------------------- |
-| `random` (default) | Shuffle all candidate routes for each connection; try each item once   | Try remaining candidates                 |
-| `sequential`       | Try candidate routes in list order                                     | Try subsequent candidates                |
-| `chain`            | Traverse every jump host in order: local → first → second → … → target | Fail the whole chain; never bypass a hop |
+| Strategy               | Meaning of `gateways`                                                  | On failure                               |
+| ---------------------- | ---------------------------------------------------------------------- | ---------------------------------------- |
+| `sequential` (default) | Try candidate routes in list order                                     | Try subsequent candidates                |
+| `random`               | Shuffle all candidate routes for each connection; try each item once   | Try remaining candidates                 |
+| `chain`                | Traverse every jump host in order: local → first → second → … → target | Fail the whole chain; never bypass a hop |
 
 ```toml
 [hosts.balanced]
@@ -431,6 +434,7 @@ Stats include `sent_bytes`, `received_bytes`, `duration_seconds`,
 Desktop notifications require `osascript` on macOS or `notify-send` on Linux.
 
 `on_connect` means transport establishment, not successful SSH authentication.
+A `notify` hook for that event is titled `sshweave: transport established`.
 `on_disconnect` runs when the transport closes, not when each multiplexed SSH
 session ends.
 
@@ -441,32 +445,39 @@ Configuration is **trusted executable input**; do not load untrusted TOML/hooks.
 
 ## Commands
 
-| Task                                             | Command                                           |
-| ------------------------------------------------ | ------------------------------------------------- |
-| Validate a chosen configuration                  | `sshweave -c ./sshweave.toml config check`        |
-| Print generated OpenSSH configuration            | `sshweave config build`                           |
-| Update the managed configuration file            | `sshweave config build --write`                   |
-| Generate configuration without automatic updates | `sshweave config build --no-automatic-rewrite`    |
-| List hosts, aliases, and patterns                | `sshweave config list`                            |
-| List resolved hosts as JSON                      | `sshweave config list --json`                     |
-| Search hosts                                     | `sshweave config search production`               |
-| Inspect a host or chain                          | `sshweave config resolve database/bastion`        |
-| Export merged configuration                      | `sshweave config json`                            |
-| Export resolved concrete hosts                   | `sshweave config json --expand`                   |
-| Preview routes as JSON, without connecting       | `sshweave connect --dry-run database`             |
-| Export relationships as Graphviz DOT             | `sshweave config graphviz`                        |
-| Probe direct TCP latency, not ICMP               | `sshweave ping --count 4 --interval 0.5 database` |
-| Show version, paths, and loaded files            | `sshweave info`                                   |
-| Generate shell completions                       | `sshweave completions zsh`                        |
+| Task                                                | Command                                           |
+| --------------------------------------------------- | ------------------------------------------------- |
+| Validate a chosen configuration                     | `sshweave -c ./sshweave.toml config check`        |
+| Print generated OpenSSH configuration               | `sshweave config build`                           |
+| Update the managed configuration file               | `sshweave config build --write`                   |
+| Generate configuration without automatic updates    | `sshweave config build --no-automatic-rewrite`    |
+| List hosts, aliases, and patterns                   | `sshweave config list`                            |
+| List resolved hosts as JSON                         | `sshweave config list --json`                     |
+| Search hosts                                        | `sshweave config search production`               |
+| Inspect a host or chain                             | `sshweave config resolve database/bastion`        |
+| Show which entry supplied each field                | `sshweave config explain database`                |
+| Export merged configuration                         | `sshweave config json`                            |
+| Export resolved concrete hosts                      | `sshweave config json --expand`                   |
+| Preview routes as JSON, without connecting          | `sshweave connect --dry-run database`             |
+| Export relationships as Graphviz DOT                | `sshweave config graphviz`                        |
+| Probe TCP latency of the first route hop            | `sshweave ping --count 4 --interval 0.5 database` |
+| Check Include placement and print Git's SSH command | `sshweave doctor`                                 |
+| Show version, paths, and loaded files               | `sshweave info`                                   |
+| Generate shell completions                          | `sshweave completions zsh`                        |
 
 Global options: `--config`/`-c`, `--verbose`/`-v`, and `--debug`.
 `SSHWEAVE_CONFIG`, `SSHWEAVE_DEBUG`, and standard `RUST_LOG` are supported.
 Use `sshweave <command> --help` for available options, except wrapper help,
 which uses `sshweave help wrapper`.
 
-`ping` uses direct TCP, **not configured gateways or proxies**. It defaults to
+`ping` times a TCP handshake to the first hop of the selected route: the
+proxy, or the outermost gateway. It does not start `proxy_command`, authenticate,
+or dial past that hop. `random` routes are probed in configuration order. `-p`
+overrides the port only when the probe is the destination itself. It defaults to
 4 probes; `--count 0` runs until Ctrl+C. No successful probes means a failure exit
-status. SVG export with `sshweave config graphviz | dot -Tsvg > hosts.svg`
+status. `doctor` prints the Include line and `GIT_SSH_COMMAND`; an Include placed
+after a `Host` or `Match` block is an error. `config build --write` lists added
+and removed `Host` lines before replacing a managed file. SVG export with `sshweave config graphviz | dot -Tsvg > hosts.svg`
 requires the optional Graphviz `dot` command.
 
 ### Connection sharing
@@ -499,7 +510,8 @@ changes; close them when ready to reconnect.
 
 ### Managing materialized targets
 
-Names used for dynamic hosts and chains are remembered in `settings.known_hosts`.
+Names used for dynamic hosts and chains are remembered in `settings.registry`
+(`known_hosts` is still accepted as an alias).
 This is a target cache, **not OpenSSH's host-key database**.
 Use names from `cache list` in place of `old-worker` below:
 

@@ -197,7 +197,7 @@ gateways = ["outer", "inner"]
     let (_dir, defaults) = fixture("[hosts.db]\ngateways=['a','b']")?;
     assert_eq!(
         defaults.resolve("db")?.gateway_strategy,
-        GatewayStrategy::Random
+        GatewayStrategy::Sequential
     );
     assert_eq!(defaults.resolve("unknown")?.routes(), ["direct"]);
     Ok(())
@@ -518,7 +518,7 @@ aliases = ["database"]
 "#,
     )?;
     let graph = render::graphviz(&config)?;
-    assert!(graph.contains("\"db\" -> \"bastion\" [label=\"gateway (random)\"]"));
+    assert!(graph.contains("\"db\" -> \"bastion\" [label=\"gateway (sequential)\"]"));
     assert!(graph.contains("\"db\" -> \"template:base\""));
     assert!(graph.contains("\"database\" -> \"db\""));
     Ok(())

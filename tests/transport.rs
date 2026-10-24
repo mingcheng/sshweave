@@ -61,12 +61,15 @@ async fn default_paths_keep_generated_state_in_config_directory() -> Result<()> 
         directory.join("sshweave.conf").to_string_lossy().as_ref()
     );
     assert_eq!(
-        info["known_hosts"],
+        info["registry"],
         directory
             .join("sshweave_known_hosts.json")
             .to_string_lossy()
             .as_ref()
     );
+    assert!(info["git_ssh_command"].as_str().unwrap().contains("-F"));
+    assert!(info["include"].as_str().unwrap().starts_with("Include "));
+    assert!(info["rewrite"].as_str().unwrap().contains("wrapper"));
 
     let output = binary()
         .env("HOME", &home_path)
@@ -162,8 +165,10 @@ async fn config_environment_and_cli_override_default_path() -> Result<()> {
 #[tokio::test]
 async fn default_fragments_merge_with_explicit_includes_and_root() -> Result<()> {
     let home = tempfile::tempdir()?;
-    let (root_dir, source) = fixture("")?;
-    let fragments = home.path().join(".config/sshweave/conf.d");
+    let config_dir = home.path().join(".config/sshweave");
+    fs::create_dir_all(&config_dir)?;
+    let source = config_dir.join("sshweave.toml");
+    let fragments = config_dir.join("conf.d");
     fs::create_dir_all(&fragments)?;
     fs::write(
         fragments.join("a.toml"),
@@ -183,7 +188,7 @@ async fn default_fragments_merge_with_explicit_includes_and_root() -> Result<()>
     )?;
     fs::write(fragments.join("ignored.txt"), "not TOML")?;
     fs::write(
-        root_dir.path().join("extra.toml"),
+        config_dir.join("extra.toml"),
         "[hosts.db]\nport=3300\nuser='explicit'",
     )?;
     let export = || {
@@ -261,14 +266,45 @@ async fn default_fragments_merge_with_explicit_includes_and_root() -> Result<()>
     let host: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(host["user"], "root");
     assert_eq!(host["port"], 2202);
+
+    let (_dir, other) = fixture("[hosts.db]\nuser='only-root'\n")?;
+    let output = binary()
+        .env("HOME", home.path())
+        .env_remove("SSHWEAVE_CONFIG")
+        .arg("-c")
+        .arg(&other)
+        .args(["config", "json"])
+        .output()
+        .await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert!(value["document"]["includes"].as_array().unwrap().is_empty());
+    let output = binary()
+        .env("HOME", home.path())
+        .env_remove("SSHWEAVE_CONFIG")
+        .arg("-c")
+        .arg(&other)
+        .args(["config", "resolve", "db"])
+        .output()
+        .await?;
+    assert!(output.status.success());
+    let host: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(host["user"], "only-root");
     Ok(())
 }
 
 #[tokio::test]
 async fn default_fragments_allow_empty_directory_but_report_invalid_files() -> Result<()> {
     let home = tempfile::tempdir()?;
-    let (_dir, source) = fixture("")?;
-    let fragments = home.path().join(".config/sshweave/conf.d");
+    let config_dir = home.path().join(".config/sshweave");
+    fs::create_dir_all(&config_dir)?;
+    let source = config_dir.join("sshweave.toml");
+    fs::write(&source, "[defaults]\nuser='ops'\n")?;
+    let fragments = config_dir.join("conf.d");
     let check = || {
         let mut command = binary();
         command
@@ -716,7 +752,7 @@ fi
         &path,
         format!(
             "[settings]\noutput='generated.conf'\nknown_hosts='known.json'\nssh_binary='{}'\n\
-         [hosts.db]\ngateways=['a','b','c']\n\
+         [hosts.db]\ngateways=['a','b','c']\ngateway_strategy='random'\n\
          [hosts.db.hooks]\non_connect_error=[{{driver='write',message='failed-route:{{{{ gateway }}}}'}}]\n",
             ssh.display()
         ),
@@ -874,9 +910,7 @@ async fn dry_run_exposes_effective_strategy_and_normalized_chain() -> Result<()>
         assert_eq!(value["routes"], serde_json::json!(expected));
         assert_eq!(
             value["host"]["gateway_strategy"],
-            if strategy.is_empty() {
-                "random"
-            } else if expected.len() == 1 {
+            if strategy.contains("chain") {
                 "chain"
             } else {
                 "sequential"
@@ -987,26 +1021,66 @@ proxy="other"
 }
 
 #[tokio::test]
-async fn ping_and_dry_run_do_not_bypass_or_connect_to_a_configured_proxy() -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
+async fn ping_probes_the_first_hop_without_bypassing_a_proxy() -> Result<()> {
+    let proxy = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_port = proxy.local_addr()?.port();
+    let destination = TcpListener::bind("127.0.0.1:0").await?;
+    let destination_port = destination.local_addr()?.port();
+    let gateway = TcpListener::bind("127.0.0.1:0").await?;
+    let gateway_port = gateway.local_addr()?.port();
     let (dir, path) = fixture(&format!(
-        "[proxies.local]\nurl='http://127.0.0.1:{port}'\n[hosts.db]\nhostname='127.0.0.1'\nport={port}\nproxy='local'"
+        "[proxies.local]\nurl='http://127.0.0.1:{proxy_port}'\n\
+         [hosts.jump]\nhostname='127.0.0.1'\nport={gateway_port}\n\
+         [hosts.proxied]\nhostname='192.0.2.55'\nport={destination_port}\nproxy='local'\n\
+         [hosts.behind]\nhostname='192.0.2.55'\nport={destination_port}\ngateways=['jump']\n\
+         [hosts.custom]\nproxy_command=['true']"
     ))?;
     let output = binary()
         .arg("-c")
         .arg(&path)
-        .args(["ping", "--count", "1", "db"])
+        .args(["ping", "--count", "1", "proxied"])
         .output()
         .await?;
-    assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("ping supports direct TCP routes only")
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("via proxy local"), "{text}");
+    assert!(text.contains(&proxy_port.to_string()), "{text}");
+    assert!(
+        timeout(Duration::from_millis(50), destination.accept())
+            .await
+            .is_err()
+    );
+    let _ = proxy.accept().await?;
     let output = binary()
         .arg("-c")
         .arg(&path)
-        .args(["connect", "--dry-run", "db"])
+        .args(["ping", "--count", "1", "behind"])
+        .output()
+        .await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("via gateway jump"), "{text}");
+    let _ = gateway.accept().await?;
+    let output = binary()
+        .arg("-c")
+        .arg(&path)
+        .args(["ping", "--count", "1", "custom"])
+        .output()
+        .await?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not start proxy_command"));
+    let output = binary()
+        .arg("-c")
+        .arg(&path)
+        .args(["connect", "--dry-run", "proxied"])
         .output()
         .await?;
     assert!(output.status.success());
@@ -1014,7 +1088,7 @@ async fn ping_and_dry_run_do_not_bypass_or_connect_to_a_configured_proxy() -> Re
     assert_eq!(value["host"]["options"]["proxy"], "local");
     assert_eq!(value["routes"], serde_json::json!(["direct"]));
     assert!(
-        timeout(Duration::from_millis(20), listener.accept())
+        timeout(Duration::from_millis(20), proxy.accept())
             .await
             .is_err()
     );
@@ -1404,5 +1478,138 @@ LocalForward=["9090 localhost:90"]
         .collect::<Vec<_>>();
     assert_eq!(forwards.len(), 1);
     assert!(forwards[0].contains("9090"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn doctor_and_search_report_integration_and_resolved_names() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let (dir, path) = fixture(
+        "[proxies.office]\nurl='http://127.0.0.1:9'\n\
+         [templates.production]\nuser='deploy'\n\
+         [defaults]\nuser='fallback'\n\
+         [hosts.db]\ninherits=['production']\nhostname='10.1.0.5'\naliases=['database']\n\
+         user='dbuser'\ncomment='primary'\nproxy='office'\nrate_limit='5 MiB/s'\n\
+         gateways=['bastion']\ngateway_strategy='sequential'\n",
+    )?;
+    let run = |args: &[&str]| {
+        let mut command = binary();
+        command
+            .env("HOME", home.path())
+            .env_remove("SSHWEAVE_CONFIG")
+            .arg("-c")
+            .arg(&path)
+            .args(args);
+        command
+    };
+    for query in [
+        "production",
+        "office",
+        "database",
+        "primary",
+        "10.1.0.5",
+        "bastion",
+        "sequential",
+    ] {
+        let output = run(&["config", "search", query]).output().await?;
+        assert!(
+            output.status.success(),
+            "{query}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("db ->"),
+            "{query}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    let explained = String::from_utf8(
+        run(&["config", "explain", "database"])
+            .output()
+            .await?
+            .stdout,
+    )?;
+    assert!(explained.contains("matched: host db"), "{explained}");
+    assert!(explained.contains("hostname: 10.1.0.5"), "{explained}");
+    assert!(
+        explained.contains("  from host db")
+            && explained.contains("  hidden template production: deploy"),
+        "{explained}"
+    );
+    assert!(
+        explained.contains("  hidden defaults: fallback"),
+        "{explained}"
+    );
+    assert!(
+        explained.contains("combined send and receive, this connection only"),
+        "{explained}"
+    );
+    let chained = String::from_utf8(
+        run(&["config", "explain", "database/bastion"])
+            .output()
+            .await?
+            .stdout,
+    )?;
+    assert!(
+        chained.contains("explicit chain overrides configured gateways"),
+        "{chained}"
+    );
+
+    let listed = String::from_utf8(run(&["config", "list"]).output().await?.stdout)?;
+    assert!(listed.contains("database -> db"), "{listed}");
+    assert!(
+        listed.contains("combined send and receive, this connection only"),
+        "{listed}"
+    );
+
+    let output = run(&["doctor"]).output().await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout)?;
+    assert!(text.contains("GIT_SSH_COMMAND="), "{text}");
+    assert!(text.contains("not written"), "{text}");
+    assert!(text.contains("Host * ProxyCommand"), "{text}");
+
+    let built = run(&["config", "build", "--write"]).output().await?;
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    assert!(String::from_utf8_lossy(&built.stderr).contains("Host * ProxyCommand"));
+    let mut source = fs::read_to_string(&path)?;
+    source.push_str("\n[hosts.extra]\nhostname='10.9.9.9'\n");
+    fs::write(&path, source)?;
+    let rebuilt = run(&["config", "build", "--write"]).output().await?;
+    assert!(rebuilt.status.success());
+    assert!(
+        String::from_utf8_lossy(&rebuilt.stderr).contains("+ Host extra"),
+        "{}",
+        String::from_utf8_lossy(&rebuilt.stderr)
+    );
+    let generated = dir.path().join("generated.conf").canonicalize()?;
+    let ssh_dir = home.path().join(".ssh");
+    fs::create_dir_all(&ssh_dir)?;
+    let include = format!("'{}'", generated.display());
+    fs::write(
+        ssh_dir.join("config"),
+        format!("Host *\n  User x\n\nInclude {include}\n"),
+    )?;
+    let output = run(&["doctor"]).output().await?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("after a Host or Match block"));
+    fs::write(
+        ssh_dir.join("config"),
+        format!("Include {include}\n\nHost other\n  User x\n"),
+    )?;
+    let output = run(&["doctor"]).output().await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
     Ok(())
 }

@@ -4,7 +4,7 @@
 //! commands, invoking hooks, or writing files.
 
 use crate::{
-    config::Config,
+    config::{Config, GatewayStrategy},
     proxy,
     resolver::{MAX_GATEWAY_DEPTH, Resolver},
     util,
@@ -206,9 +206,110 @@ pub fn write(
         output,
         "\nRead top to bottom: Local -> proxy/gateways -> target.\n\
          sequential = ordered fallback; random = candidates shown in configuration order, shuffled only when connecting;\n\
-         chain = all hops in order. Preview only: no network, commands, hooks, or configuration writes."
+         chain = all hops in order. Preview only: no network, commands, hooks, or configuration writes.\n\
+         sshweave ping times a TCP handshake to the first hop and does not follow the rest of this preview."
     )?;
     Ok(())
+}
+
+/// TCP endpoint measured by `sshweave ping`.
+///
+/// Planning walks the first configured route only. It does not connect, run
+/// commands, or shuffle `random` candidates.
+pub struct TcpProbe {
+    /// Address passed to `TcpStream::connect`.
+    pub hostname: String,
+    /// Port passed to `TcpStream::connect`.
+    pub port: u16,
+    /// Host whose `resolve_command` and control-path setup run before dialing.
+    pub prepare_host: Option<String>,
+    /// Whether `ping -p` replaces [`TcpProbe::port`]. True only for a direct
+    /// destination with no proxy.
+    pub honor_port_override: bool,
+    /// Short description of the hop, for the probe banner.
+    pub via: String,
+}
+
+/// Resolves the first TCP hop of `target`.
+///
+/// A configured proxy is the hop, so the destination is not dialed directly.
+/// `proxy_command` has no inferable address and is rejected.
+pub fn tcp_probe(config: &Config, target: &str) -> Result<TcpProbe> {
+    fn walk(
+        resolver: &Resolver<'_>,
+        config: &Config,
+        target: &str,
+        inherited_proxy: Option<&str>,
+        stack: &mut Vec<String>,
+        random_first: bool,
+    ) -> Result<TcpProbe> {
+        ensure!(
+            stack.len() < MAX_GATEWAY_DEPTH && !stack.iter().any(|name| name == target),
+            "gateway cycle/depth limit: {} -> {target}",
+            stack.join(" -> ")
+        );
+        stack.push(target.into());
+        let result = (|| {
+            let host = resolver.resolve(target)?;
+            let proxy_name = inherited_proxy.or(host.options.proxy.as_deref());
+            let routes = host.routes();
+            let gateway = routes.first().context("host has no route")?;
+            let random_first = random_first
+                || (host.gateway_strategy == GatewayStrategy::Random && routes.len() > 1);
+            if gateway != "direct" {
+                return walk(resolver, config, gateway, proxy_name, stack, random_first);
+            }
+            ensure!(
+                host.options.proxy_command.is_none(),
+                "ping measures a TCP handshake and does not start proxy_command on {}",
+                host.name
+            );
+            let note = if random_first {
+                "; configuration order, not the shuffled connect order"
+            } else {
+                ""
+            };
+            if let Some(name) = proxy_name {
+                let definition = config
+                    .document
+                    .proxies
+                    .get(name)
+                    .with_context(|| format!("unknown proxy {name:?}"))?;
+                let endpoint = proxy::Endpoint::parse(&definition.url)?;
+                return Ok(TcpProbe {
+                    hostname: endpoint.host,
+                    port: endpoint.port,
+                    prepare_host: None,
+                    honor_port_override: false,
+                    via: format!("proxy {name} ({}){note}", definition.url),
+                });
+            }
+            let direct = stack.len() == 1;
+            Ok(TcpProbe {
+                hostname: host.hostname.clone(),
+                port: host.port,
+                prepare_host: (host.options.resolve_command.is_some() || direct)
+                    .then(|| host.name.clone()),
+                honor_port_override: direct,
+                via: format!(
+                    "{} {}{note}",
+                    if direct { "direct" } else { "gateway" },
+                    host.name
+                ),
+            })
+        })();
+        stack.pop();
+        result
+    }
+
+    walk(
+        &config.resolver()?,
+        config,
+        target,
+        None,
+        &mut Vec::new(),
+        false,
+    )
 }
 
 /// Prints the topology of `target` to stdout, styling only on capable terminals

@@ -88,7 +88,7 @@ impl Hook {
                 });
             }
             Self::Notify { .. } => {
-                let status = notification(&value)
+                let status = notification(event, &value)
                     .stdin(Stdio::null())
                     .stdout(stderr_output()?)
                     .stderr(Stdio::inherit())
@@ -137,23 +137,33 @@ fn shell(script: &str, context: &Value) -> Result<Command> {
     Ok(command)
 }
 
+/// Title shown by the desktop notification. `on_connect` fires when the byte
+/// stream is up, before OpenSSH authentication finishes.
+fn notification_title(event: Event) -> &'static str {
+    match event {
+        Event::OnConnect => "sshweave: transport established",
+        _ => "sshweave",
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn notification(message: &str) -> Command {
+fn notification(event: Event, message: &str) -> Command {
     let mut command = Command::new("osascript");
     // Pass text as argv rather than interpolating it into AppleScript source.
     command.args([
         "-e",
-        "on run argv\n display notification (item 1 of argv) with title \"sshweave\"\nend run",
+        "on run argv\n display notification (item 2 of argv) with title (item 1 of argv)\nend run",
         "--",
+        notification_title(event),
         message,
     ]);
     command
 }
 
 #[cfg(not(target_os = "macos"))]
-fn notification(message: &str) -> Command {
+fn notification(event: Event, message: &str) -> Command {
     let mut command = Command::new("notify-send");
-    command.args(["sshweave", message]);
+    command.args([notification_title(event), message]);
     command
 }
 

@@ -109,9 +109,9 @@ pub struct Host {
 #[serde(rename_all = "snake_case")]
 pub enum GatewayStrategy {
     /// Try every candidate in a freshly shuffled order.
-    #[default]
     Random,
-    /// Try candidates in configuration order.
+    /// Try candidates in configuration order. This is the default.
+    #[default]
     Sequential,
     /// Traverse all gateways as one multi-hop route, outermost first.
     Chain,
@@ -283,6 +283,10 @@ pub struct Settings {
     /// Generated OpenSSH configuration file.
     pub output: String,
     /// Registry of dynamically materialized targets (not OpenSSH's known_hosts).
+    ///
+    /// TOML accepts `registry` and the older `known_hosts` key. The on-disk
+    /// default remains `sshweave_known_hosts.json`.
+    #[serde(rename = "registry", alias = "known_hosts")]
     pub known_hosts: String,
     /// OpenSSH client used for gateways, wrappers, and control sockets.
     pub ssh_binary: String,
@@ -351,6 +355,13 @@ fn merge_entries(existing: &mut IndexMap<String, Host>, incoming: IndexMap<Strin
             existing.insert(name, host);
         }
     }
+}
+
+/// The default root file is the only one that implicitly loads conf.d.
+fn is_default_source(path: &Path) -> Result<bool> {
+    let home = std::env::var("HOME").context("HOME is not set")?;
+    let default = PathBuf::from(home).join(".config/sshweave/sshweave.toml");
+    Ok(normalized(default)? == path)
 }
 
 /// Canonicalizes `path`, or lexically normalizes it when it does not exist yet.
@@ -428,10 +439,13 @@ impl Config {
         // Only the implicit default directory may match nothing.
         let default_pattern = if root {
             self.document.settings = doc.settings;
-            if !doc
-                .includes
-                .iter()
-                .any(|include| include == DEFAULT_INCLUDE)
+            // Fragments are implicit only for the default config file. A config
+            // selected with -c stays isolated unless it lists this include.
+            if is_default_source(&path)?
+                && !doc
+                    .includes
+                    .iter()
+                    .any(|include| include == DEFAULT_INCLUDE)
             {
                 doc.includes.insert(0, DEFAULT_INCLUDE.into());
             }
@@ -556,11 +570,11 @@ impl Config {
         let known = normalized(self.known_hosts()?)?;
         ensure!(
             !self.files.contains(&output) && !self.files.contains(&known),
-            "output and known_hosts must not overwrite any source configuration"
+            "output and registry must not overwrite any source configuration"
         );
         ensure!(
             output != known,
-            "output and known_hosts must be different files"
+            "output and registry must be different files"
         );
         Ok(())
     }

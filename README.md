@@ -85,11 +85,11 @@ gateways = ["direct", "bastion"]
 gateway_strategy = "sequential"
 ```
 
-This tries the database directly first, then through the bastion. The default
-gateway strategy is `random`; set `sequential` explicitly when order matters.
-For a fixed chain through every jump host, use `chain` with SSH gateway names
-only, without a `direct` entry; see
-[gateways and failover](examples/README.md#gateways-and-failover).
+This tries the database directly first, then through the bastion. Omitting
+`gateway_strategy` does the same thing: the default is `sequential`. Set
+`random` only when the candidates should be shuffled. For a fixed chain through
+every jump host, use `chain` with SSH gateway names only, without a `direct`
+entry; see [gateways and failover](examples/README.md#gateways-and-failover).
 
 For the more advanced configuration options and examples, see the [examples guide](examples/README.md).
 

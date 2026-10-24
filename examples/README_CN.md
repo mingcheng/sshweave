@@ -160,8 +160,10 @@ sshweave 只覆盖带有自身标记的生成文件，**不会自动改写手写
 默认文件为 `~/.config/sshweave/sshweave.toml`。可在子命令之前使用 `-c`，
 或设置 `SSHWEAVE_CONFIG` 选择其他文件。相对配置路径以 TOML 文件所在目录为基准。
 
-即使使用其他根配置，也始终加载 `~/.config/sshweave/conf.d/*.toml`；
-该目录可为空或不存在。其他文件使用 `includes` 引入。
+只有根文件是 `~/.config/sshweave/sshweave.toml` 时，才会自动加载
+`~/.config/sshweave/conf.d/*.toml`。该目录可为空或不存在。
+用 `-c` 或 `SSHWEAVE_CONFIG` 指定其他文件时，不会加载 conf.d，除非该文件自己列出这个 include。
+其他文件使用 `includes` 引入。
 生成配置与主机缓存默认使用下例中的路径；修改 `settings.output` 后，
 也要更新 OpenSSH Include。
 
@@ -173,7 +175,7 @@ sshweave 只覆盖带有自身标记的生成文件，**不会自动改写手写
 
 [settings]
 output = "~/.config/sshweave/sshweave.conf"
-known_hosts = "~/.config/sshweave/sshweave_known_hosts.json"
+registry = "~/.config/sshweave/sshweave_known_hosts.json"
 ssh_binary = "ssh"
 automatic_rewrite = true
 
@@ -271,12 +273,12 @@ proxy_command = ["nc", "%h", "%p"]
 ## 网关与故障切换
 
 可在主机、模板或 defaults 中设置 `gateways` 与 `gateway_strategy`，两者独立继承。
-**默认策略是 `random`**；需要优先直连或其他固定回退顺序时，显式使用 `sequential`。
+**默认策略是 `sequential`**，按列表顺序尝试候选。需要每次打乱时，显式设置 `gateway_strategy = "random"`。
 
-| 策略             | `gateways` 的含义                                         | 失败行为                   |
-| ---------------- | --------------------------------------------------------- | -------------------------- |
-| `random`（默认） | 每次连接随机打乱全部候选路由，每个列表项尝试一次          | 依次尝试剩余候选           |
-| `sequential`     | 按列表顺序尝试候选路由                                    | 依次尝试后续候选           |
+| 策略                 | `gateways` 的含义                                         | 失败行为                   |
+| -------------------- | --------------------------------------------------------- | -------------------------- |
+| `sequential`（默认） | 按列表顺序尝试候选路由                                    | 依次尝试后续候选           |
+| `random`             | 每次连接随机打乱全部候选路由，每个列表项尝试一次          | 依次尝试剩余候选           |
 | `chain`          | 按列表顺序经过所有跳板，本机 → 第一项 → 第二项 → … → 目标 | 整条链失败，不绕过任何跳板 |
 
 ```toml
@@ -408,7 +410,7 @@ stats 包含 `sent_bytes`、`received_bytes`、`duration_seconds`、
 `average_bytes_per_second` 和 `connected_at`/`disconnected_at`（Unix 秒）。
 桌面通知需要 macOS 的 `osascript` 或 Linux 的 `notify-send`。
 
-`on_connect` 表示传输已建立，不表示 SSH 认证成功。
+`on_connect` 表示传输已建立，不表示 SSH 认证成功。该事件的 notify 标题是 `sshweave: transport established`。
 `on_disconnect` 在传输连接关闭时触发，而不是在每个复用的 SSH 会话结束时触发。
 
 exec/daemon 还会获得 JSON 环境变量 `SSHWEAVE_CONTEXT`。若在 shell 模板中插入
@@ -427,11 +429,13 @@ exec/daemon 还会获得 JSON 环境变量 `SSHWEAVE_CONTEXT`。若在 shell 模
 | 以 JSON 列出解析后的主机     | `sshweave config list --json`                     |
 | 搜索主机                     | `sshweave config search production`               |
 | 查看主机或链式目标           | `sshweave config resolve database/bastion`        |
+| 查看每个字段来自哪一层配置   | `sshweave config explain database`                |
 | 导出合并后的配置             | `sshweave config json`                            |
 | 导出解析后的具体主机         | `sshweave config json --expand`                   |
 | 以 JSON 预览路由，不连接     | `sshweave connect --dry-run database`             |
 | 将关系导出为 Graphviz DOT    | `sshweave config graphviz`                        |
-| 探测直连 TCP 延迟，而非 ICMP | `sshweave ping --count 4 --interval 0.5 database` |
+| 探测所选路线第一跳的 TCP 延迟 | `sshweave ping --count 4 --interval 0.5 database` |
+| 检查 Include 并打印 Git 的 SSH 命令 | `sshweave doctor`                         |
 | 查看版本、路径及已加载文件   | `sshweave info`                                   |
 | 生成 shell 补全              | `sshweave completions zsh`                        |
 
@@ -440,8 +444,12 @@ exec/daemon 还会获得 JSON 环境变量 `SSHWEAVE_CONTEXT`。若在 shell 模
 通过 `sshweave <command> --help` 查看选项；wrapper 例外，
 需使用 `sshweave help wrapper`。
 
-`ping` 使用直连 TCP，**不经过配置的网关或代理**。默认探测 4 次，
+`ping` 对所选路线的第一跳做 TCP 握手计时：代理，或最外层跳板。
+它不启动 `proxy_command`，不认证，也不继续拨后面的跳。`random` 按配置顺序探测。
+`-p` 只在探测目标本身时覆盖端口。默认探测 4 次，
 `--count 0` 持续运行至 Ctrl+C；没有成功探测时返回失败状态。
+`doctor` 打印 Include 行和 `GIT_SSH_COMMAND`；Include 写在 `Host` 或 `Match` 之后会报错。
+`config build --write` 在覆盖已托管文件之前，列出新增和删除的 `Host` 行。
 使用 `sshweave config graphviz | dot -Tsvg > hosts.svg` 导出 SVG，
 需另外安装 Graphviz 的 `dot` 命令。
 
@@ -474,7 +482,7 @@ sshweave sockets flush
 
 ### 管理已实例化主机缓存
 
-动态主机和链式目标使用过的名称会记录在 `settings.known_hosts` 中。
+动态主机和链式目标使用过的名称会记录在 `settings.registry` 中（仍接受旧键名 `known_hosts`）。
 这是目标名称缓存，**不是 OpenSSH 的主机密钥数据库**。
 使用 `cache list` 返回的名称替换下面的 `old-worker`：
 

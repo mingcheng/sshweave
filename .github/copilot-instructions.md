@@ -54,9 +54,11 @@ and [sample configuration](../examples/sshweave.toml). Chinese counterparts are
 ## Repository-specific conventions
 
 - Relative configuration paths resolve from the TOML file's directory.
-  `$HOME/.config/sshweave/conf.d/*.toml` is automatically loaded. Integration
-  tests isolate `HOME` through [tests/common](../tests/common/mod.rs); preserve
-  that isolation instead of reading the developer's configuration.
+  `$HOME/.config/sshweave/conf.d/*.toml` is loaded automatically only when the
+  root file is the default `~/.config/sshweave/sshweave.toml`. The default
+  gateway strategy is `sequential`; `random` is explicit. Integration tests
+  isolate `HOME` through [tests/common](../tests/common/mod.rs); preserve that
+  isolation instead of reading the developer's configuration.
 - Rendering must stay deterministic. Emit concrete hosts before wildcard rules,
   and exclude materialized hosts from wildcard rules so OpenSSH does not
   accumulate options from both.
